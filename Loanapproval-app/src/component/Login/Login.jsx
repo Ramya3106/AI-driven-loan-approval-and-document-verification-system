@@ -10,8 +10,14 @@ import {
   Platform,
 } from 'react-native';
 
-export default function Login() {
+export default function Login({ navigation }) {
   const [isLogin, setIsLogin] = useState(true);
+
+  const handleLogin = () => {
+    // Add your authentication logic here
+    // For now, navigate directly to Application page
+    navigation.navigate('Application');
+  };
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -94,7 +100,10 @@ export default function Login() {
             </View>
           )}
 
-          <TouchableOpacity style={styles.primaryButton}>
+          <TouchableOpacity 
+            style={styles.primaryButton}
+            onPress={handleLogin}
+          >
             <Text style={styles.primaryButtonText}>
               {isLogin ? 'Login 🔑' : 'Create Account'}
             </Text>
