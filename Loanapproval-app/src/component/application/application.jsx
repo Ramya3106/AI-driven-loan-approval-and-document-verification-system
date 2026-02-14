@@ -195,7 +195,7 @@ export default function Application({ navigation }) {
 
             {/* Submit Button */}
             <TouchableOpacity style={styles.submitButton} onPress={handleSubmit}>
-              <Text style={styles.submitButtonText}>Next → Check Existing Loans</Text>
+              <Text style={styles.submitButtonText}>Next → </Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
