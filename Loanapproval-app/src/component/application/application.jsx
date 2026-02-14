@@ -79,9 +79,8 @@ export default function Application({ navigation }) {
       return;
     }
     
-    // Navigate to next page (Check Existing Loans)
-    console.log('Form Data:', formData);
-    // navigation.navigate('ExistingLoans', { formData });
+    // Navigate to Existing Loan Details page
+    navigation.navigate('ExistingLoanDetails', { formData });
   };
 
   return (
