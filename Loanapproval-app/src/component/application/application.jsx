@@ -109,8 +109,8 @@ export default function Application({ navigation }) {
               </View>
             </View>
 
-            {/* Row 2: Job Type & Annual Income */}
-            <View style={styles.row}>
+            {/* Job Type */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>Job Type *</Text>
                 <TouchableOpacity 
@@ -123,7 +123,10 @@ export default function Application({ navigation }) {
                   <Text style={styles.dropdownIcon}>▼</Text>
                 </TouchableOpacity>
               </View>
+            </View>
 
+            {/* Annual Income */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>Annual Income (₹) *</Text>
                 <TextInput
@@ -136,8 +139,8 @@ export default function Application({ navigation }) {
               </View>
             </View>
 
-            {/* Row 3: Monthly Income & CIBIL Score */}
-            <View style={styles.row}>
+            {/* Monthly Income */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>Monthly Income (₹)</Text>
                 <TextInput
@@ -151,7 +154,10 @@ export default function Application({ navigation }) {
                   <Text style={styles.helperText}>Auto-calculated</Text>
                 )}
               </View>
+            </View>
 
+            {/* CIBIL Score */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>CIBIL Score *</Text>
                 <TextInput
@@ -165,8 +171,8 @@ export default function Application({ navigation }) {
               </View>
             </View>
 
-            {/* Row 4: Loan Type & Required Loan Amount */}
-            <View style={styles.row}>
+            {/* Loan Type */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>Loan Type *</Text>
                 <TouchableOpacity 
@@ -179,7 +185,10 @@ export default function Application({ navigation }) {
                   <Text style={styles.dropdownIcon}>▼</Text>
                 </TouchableOpacity>
               </View>
+            </View>
 
+            {/* Required Loan Amount */}
+            <View style={styles.fullWidthRow}>
               <View style={styles.fieldGroup}>
                 <Text style={styles.label}>Required Loan Amount (₹) *</Text>
                 <TextInput
@@ -194,7 +203,7 @@ export default function Application({ navigation }) {
 
             {/* Submit Button */}
             <TouchableOpacity style={styles.submitButton} onPress={handleSubmit}>
-              <Text style={styles.submitButtonText}>Next → </Text>
+              <Text style={styles.submitButtonText}>Next →</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -313,7 +322,7 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   fullWidthRow: {
-    marginBottom: 16,
+    marginBottom: 20,
   },
   row: {
     flexDirection: 'row',
