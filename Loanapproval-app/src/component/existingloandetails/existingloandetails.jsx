@@ -16,13 +16,57 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import Constants from 'expo-constants';
-  const getOcrModule = () => {
+
+// Safely import OCR module only if not in Expo Go
+const getOcrModule = () => {
+  // Skip OCR in Expo Go completely
+  if (Constants.appOwnership === 'expo') {
+    return null;
+  }
+  
   try {
     const ocrModule = require('expo-mlkit-ocr');
     return ocrModule?.default || ocrModule;
   } catch (error) {
+    console.log('OCR module not available:', error.message);
     return null;
   }
+};
+
+const getApiBaseUrl = () => {
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.manifest2?.extra?.expoClient?.hostUri ||
+    Constants.manifest?.hostUri ||
+    '';
+
+  const host = hostUri ? hostUri.split(':')[0] : 'localhost';
+  return `http://${host}:5000`;
+};
+
+const runOcrViaApi = async (base64Image) => {
+  if (!base64Image) {
+    throw new Error('Missing base64 image data');
+  }
+
+  const response = await fetch(`${getApiBaseUrl()}/ocr`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ base64Image }),
+  });
+
+  if (!response.ok) {
+    throw new Error('OCR API request failed');
+  }
+
+  const data = await response.json();
+  if (!data?.text) {
+    throw new Error(data?.error || 'OCR API returned empty text');
+  }
+
+  return data.text;
 };
 
 export default function ExistingLoanDetails({ navigation, route }) {
@@ -32,6 +76,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
   const [bills, setBills] = useState([]);
   const [uploadedDocument, setUploadedDocument] = useState('');
   const [documentPickerModal, setDocumentPickerModal] = useState(false);
+  const [uploadedDocumentBase64, setUploadedDocumentBase64] = useState('');
   
   const [loanData, setLoanData] = useState({
     loanType: '',
@@ -105,48 +150,72 @@ export default function ExistingLoanDetails({ navigation, route }) {
     const normalizedName = normalizeText(applicantName);
     const normalizedAmount = loanData.totalLoanAmount.replace(/[^0-9]/g, '');
 
-    // Try OCR validation if available, otherwise skip it
+    // Document verification with OCR (native or API fallback)
+    const ocrModule = getOcrModule();
+    let extractedText = '';
+
     try {
-      const isExpoGo = Constants.appOwnership === 'expo';
-      const ocrModule = getOcrModule();
-      
-      if (!isExpoGo && ocrModule?.recognizeText) {
-        // OCR is available - perform document verification
+      if (ocrModule?.recognizeText) {
+        console.log('Starting native OCR verification...');
         const ocrResult = await ocrModule.recognizeText(uploadedDocument);
-        const ocrText = normalizeText(ocrResult?.text || '');
-        const nameTokens = applicantName
-          .split(/\s+/)
-          .map((token) => normalizeText(token))
-          .filter((token) => token.length > 1);
-
-        const nameMatch =
-          (normalizedName && ocrText.includes(normalizedName)) ||
-          (nameTokens.length > 0 && nameTokens.every((token) => ocrText.includes(token)));
-        const amountMatch = normalizedAmount && ocrText.includes(normalizedAmount);
-
-        if (!nameMatch || !amountMatch) {
-          Alert.alert('Verification Failed', 'The document does not match your loan details. Please upload a valid document.');
-          return;
-        }
-        Alert.alert('Success', 'Document verified successfully!');
+        extractedText = ocrResult?.text || '';
       } else {
-        // OCR not available - skip validation and warn user
-        console.log('OCR unavailable - skipping document verification');
-        Alert.alert(
-          'Notice',
-          'Document uploaded successfully. Note: OCR verification is not available in Expo Go. Document will be manually verified.',
-          [{ text: 'Continue', onPress: () => {} }]
-        );
+        console.log('Starting OCR API verification...');
+        extractedText = await runOcrViaApi(uploadedDocumentBase64);
       }
     } catch (error) {
       console.error('OCR Error:', error);
-      // If OCR fails, allow to continue but warn the user
       Alert.alert(
-        'Notice',
-        'Could not verify document automatically. It will be manually verified.',
-        [{ text: 'Continue', onPress: () => {} }]
+        'Verification Error',
+        'Could not process the document. Please ensure the image is clear and try again.',
+        [{ text: 'OK', style: 'destructive' }]
       );
+      return;
     }
+
+    const ocrText = normalizeText(extractedText);
+
+    // Verify applicant name
+    const nameTokens = applicantName
+      .split(/\s+/)
+      .map((token) => normalizeText(token))
+      .filter((token) => token.length > 1);
+
+    const nameMatch =
+      (normalizedName && ocrText.includes(normalizedName)) ||
+      (nameTokens.length > 0 && nameTokens.every((token) => ocrText.includes(token)));
+
+    // Verify loan amount
+    const amountMatch = normalizedAmount && ocrText.includes(normalizedAmount);
+
+    if (!nameMatch && !amountMatch) {
+      Alert.alert(
+        'Document Verification Failed',
+        'The uploaded document does not contain your name or loan amount. Please upload a valid loan document.',
+        [{ text: 'OK', style: 'destructive' }]
+      );
+      return;
+    }
+
+    if (!nameMatch) {
+      Alert.alert(
+        'Name Verification Failed',
+        `The document does not contain the applicant name "${applicantName}". Please upload a document with your name.`,
+        [{ text: 'OK', style: 'destructive' }]
+      );
+      return;
+    }
+
+    if (!amountMatch) {
+      Alert.alert(
+        'Amount Verification Failed',
+        `The document does not contain the loan amount ₹${loanData.totalLoanAmount}. Please upload a valid loan document.`,
+        [{ text: 'OK', style: 'destructive' }]
+      );
+      return;
+    }
+
+    console.log('Document verified successfully');
 
     // Check if user has pending EMI
     if (loanData.pendingEMI === 'yes') {
@@ -206,10 +275,12 @@ export default function ExistingLoanDetails({ navigation, route }) {
     const result = await ImagePicker.launchCameraAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.8,
+      base64: true,
     });
 
     if (!result.canceled && result.assets?.length) {
       setUploadedDocument(result.assets[0].uri);
+      setUploadedDocumentBase64(result.assets[0].base64 || '');
       setDocumentPickerModal(false);
     }
   };
@@ -225,10 +296,12 @@ export default function ExistingLoanDetails({ navigation, route }) {
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.8,
       selectionLimit: 1,
+      base64: true,
     });
 
     if (!result.canceled && result.assets?.length) {
       setUploadedDocument(result.assets[0].uri);
+      setUploadedDocumentBase64(result.assets[0].base64 || '');
       setDocumentPickerModal(false);
     }
   };
