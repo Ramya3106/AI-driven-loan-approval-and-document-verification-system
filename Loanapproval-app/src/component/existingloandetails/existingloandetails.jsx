@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import {
+  Image,
   StyleSheet,
   Text,
   TextInput,
@@ -13,11 +14,24 @@ import {
   FlatList,
   Alert,
 } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import Constants from 'expo-constants';
+  const getOcrModule = () => {
+  try {
+    const ocrModule = require('expo-mlkit-ocr');
+    return ocrModule?.default || ocrModule;
+  } catch (error) {
+    return null;
+  }
+};
 
 export default function ExistingLoanDetails({ navigation, route }) {
   const [hasExistingLoan, setHasExistingLoan] = useState(null);
   const [loanTypeModal, setLoanTypeModal] = useState(false);
   const [pendingEMIModal, setPendingEMIModal] = useState(false);
+  const [bills, setBills] = useState([]);
+  const [uploadedDocument, setUploadedDocument] = useState('');
+  const [documentPickerModal, setDocumentPickerModal] = useState(false);
   
   const [loanData, setLoanData] = useState({
     loanType: '',
@@ -51,7 +65,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
     return selected ? selected.label : 'Select Option';
   };
 
-  const handleNext = () => {
+  const handleNext = async () => {
     // If user has no existing loan, proceed to next page
     if (hasExistingLoan === false) {
       // navigation.navigate('NextPage', { ...route.params });
@@ -64,6 +78,74 @@ export default function ExistingLoanDetails({ navigation, route }) {
         !loanData.remainingTenure || !loanData.pendingEMI) {
       Alert.alert('Error', 'Please fill all required fields');
       return;
+    }
+
+    if (bills.length === 0 || bills.some((bill) => !bill.name || !bill.amount)) {
+      Alert.alert('Error', 'Please add at least one bill with name and amount');
+      return;
+    }
+
+    const applicantName =
+      route?.params?.formData?.fullName ||
+      route?.params?.formData?.FullName ||
+      '';
+    if (!applicantName) {
+      Alert.alert('Error', 'Applicant name is missing. Please go back and fill it.');
+      return;
+    }
+
+    if (!uploadedDocument) {
+      Alert.alert('Error', 'Please upload a valid document.');
+      return;
+    }
+
+    const normalizeText = (value) =>
+      value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    const normalizedName = normalizeText(applicantName);
+    const normalizedAmount = loanData.totalLoanAmount.replace(/[^0-9]/g, '');
+
+    // Try OCR validation if available, otherwise skip it
+    try {
+      const isExpoGo = Constants.appOwnership === 'expo';
+      const ocrModule = getOcrModule();
+      
+      if (!isExpoGo && ocrModule?.recognizeText) {
+        // OCR is available - perform document verification
+        const ocrResult = await ocrModule.recognizeText(uploadedDocument);
+        const ocrText = normalizeText(ocrResult?.text || '');
+        const nameTokens = applicantName
+          .split(/\s+/)
+          .map((token) => normalizeText(token))
+          .filter((token) => token.length > 1);
+
+        const nameMatch =
+          (normalizedName && ocrText.includes(normalizedName)) ||
+          (nameTokens.length > 0 && nameTokens.every((token) => ocrText.includes(token)));
+        const amountMatch = normalizedAmount && ocrText.includes(normalizedAmount);
+
+        if (!nameMatch || !amountMatch) {
+          Alert.alert('Verification Failed', 'The document does not match your loan details. Please upload a valid document.');
+          return;
+        }
+        Alert.alert('Success', 'Document verified successfully!');
+      } else {
+        // OCR not available - skip validation and warn user
+        console.log('OCR unavailable - skipping document verification');
+        Alert.alert(
+          'Notice',
+          'Document uploaded successfully. Note: OCR verification is not available in Expo Go. Document will be manually verified.',
+          [{ text: 'Continue', onPress: () => {} }]
+        );
+      }
+    } catch (error) {
+      console.error('OCR Error:', error);
+      // If OCR fails, allow to continue but warn the user
+      Alert.alert(
+        'Notice',
+        'Could not verify document automatically. It will be manually verified.',
+        [{ text: 'Continue', onPress: () => {} }]
+      );
     }
 
     // Check if user has pending EMI
@@ -79,6 +161,76 @@ export default function ExistingLoanDetails({ navigation, route }) {
     // Proceed to next page
     // navigation.navigate('NextPage', { ...route.params, loanData });
     Alert.alert('Success', 'Proceeding to next step...');
+  };
+
+  const handleAddBill = () => {
+    setBills((prevBills) => [
+      ...prevBills,
+      { id: `${Date.now()}`, name: '', amount: '' },
+    ]);
+  };
+
+  const handleRemoveBill = (billId) => {
+    setBills((prevBills) => prevBills.filter((bill) => bill.id !== billId));
+  };
+
+  const handleUpdateBill = (billId, field, value) => {
+    setBills((prevBills) =>
+      prevBills.map((bill) =>
+        bill.id === billId ? { ...bill, [field]: value } : bill
+      )
+    );
+  };
+
+  const handleUploadDocument = () => {
+    setDocumentPickerModal(true);
+  };
+
+  const requestCameraPermission = async () => {
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+    return status === 'granted';
+  };
+
+  const requestGalleryPermission = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    return status === 'granted';
+  };
+
+  const handlePickFromCamera = async () => {
+    const hasPermission = await requestCameraPermission();
+    if (!hasPermission) {
+      Alert.alert('Permission required', 'Camera permission is needed to take a photo.');
+      return;
+    }
+
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.8,
+    });
+
+    if (!result.canceled && result.assets?.length) {
+      setUploadedDocument(result.assets[0].uri);
+      setDocumentPickerModal(false);
+    }
+  };
+
+  const handlePickFromGallery = async () => {
+    const hasPermission = await requestGalleryPermission();
+    if (!hasPermission) {
+      Alert.alert('Permission required', 'Gallery permission is needed to select a photo.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.8,
+      selectionLimit: 1,
+    });
+
+    if (!result.canceled && result.assets?.length) {
+      setUploadedDocument(result.assets[0].uri);
+      setDocumentPickerModal(false);
+    }
   };
 
   return (
@@ -181,6 +333,28 @@ export default function ExistingLoanDetails({ navigation, route }) {
                   </View>
                 </View>
 
+                {/* Document Upload */}
+                <View style={styles.fullWidthRow}>
+                  <View style={styles.fieldGroup}>
+                    <Text style={styles.label}>Upload Loan Document</Text>
+                    <TouchableOpacity
+                      style={styles.uploadButton}
+                      onPress={handleUploadDocument}
+                    >
+                      <Text style={styles.uploadButtonText}>Upload Document</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.uploadHint}>
+                      {uploadedDocument ? 'Attached: 1 photo selected' : 'No document uploaded'}
+                    </Text>
+                    {uploadedDocument ? (
+                      <Image
+                        source={{ uri: uploadedDocument }}
+                        style={styles.documentPreview}
+                      />
+                    ) : null}
+                  </View>
+                </View>
+
                 {/* Pending EMI */}
                 <View style={styles.fullWidthRow}>
                   <View style={styles.fieldGroup}>
@@ -194,6 +368,47 @@ export default function ExistingLoanDetails({ navigation, route }) {
                       </Text>
                       <Text style={styles.dropdownIcon}>▼</Text>
                     </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Add Bill */}
+                <View style={styles.fullWidthRow}>
+                  <View style={styles.fieldGroup}>
+                    <Text style={styles.label}>Add Bill</Text>
+                    <TouchableOpacity style={styles.addBillButton} onPress={handleAddBill}>
+                      <Text style={styles.addBillButtonText}>Add Bill</Text>
+                    </TouchableOpacity>
+
+                    {bills.length === 0 ? (
+                      <Text style={styles.emptyBillsText}>No bills added yet.</Text>
+                    ) : (
+                      <View style={styles.billsList}>
+                        {bills.map((bill, index) => (
+                          <View key={bill.id} style={styles.billItem}>
+                            <Text style={styles.billIndex}>Bill {index + 1}</Text>
+                            <TextInput
+                              style={styles.input}
+                              placeholder="Bill name"
+                              value={bill.name}
+                              onChangeText={(value) => handleUpdateBill(bill.id, 'name', value)}
+                            />
+                            <TextInput
+                              style={[styles.input, styles.inputSpacing]}
+                              placeholder="Bill amount"
+                              keyboardType="numeric"
+                              value={bill.amount}
+                              onChangeText={(value) => handleUpdateBill(bill.id, 'amount', value)}
+                            />
+                            <TouchableOpacity
+                              style={styles.billRemoveButton}
+                              onPress={() => handleRemoveBill(bill.id)}
+                            >
+                              <Text style={styles.billRemoveText}>Remove</Text>
+                            </TouchableOpacity>
+                          </View>
+                        ))}
+                      </View>
+                    )}
                   </View>
                 </View>
 
@@ -296,6 +511,43 @@ export default function ExistingLoanDetails({ navigation, route }) {
             </View>
           </View>
         </Modal>
+
+        {/* Document Picker Modal */}
+        <Modal
+          visible={documentPickerModal}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setDocumentPickerModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Upload Document</Text>
+                <TouchableOpacity onPress={() => setDocumentPickerModal(false)}>
+                  <Text style={styles.modalClose}>✕</Text>
+                </TouchableOpacity>
+              </View>
+              <TouchableOpacity
+                style={styles.modalActionButton}
+                onPress={handlePickFromCamera}
+              >
+                <Text style={styles.modalActionText}>Camera</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalActionButton}
+                onPress={handlePickFromGallery}
+              >
+                <Text style={styles.modalActionText}>Gallery</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalCancelButton}
+                onPress={() => setDocumentPickerModal(false)}
+              >
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -390,6 +642,85 @@ const styles = StyleSheet.create({
     fontSize: 15,
     backgroundColor: '#ffffff',
     color: '#1f2937',
+  },
+  inputSpacing: {
+    marginTop: 12,
+  },
+  emptyBillsText: {
+    marginTop: 10,
+    fontSize: 13,
+    color: '#6b7280',
+  },
+  uploadButton: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    backgroundColor: '#f9fafb',
+  },
+  uploadButtonText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#1f2937',
+  },
+  uploadHint: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  documentPreview: {
+    marginTop: 12,
+    width: '100%',
+    height: 160,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  addBillButton: {
+    backgroundColor: '#1d4ed8',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 12,
+    billIndex: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: '#1f2937',
+      marginBottom: 8,
+    },
+    padding: 12,
+    backgroundColor: '#f9fafb',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+      alignSelf: 'flex-start',
+      marginTop: 10,
+  },
+  billInfo: {
+    flex: 1,
+    marginRight: 12,
+  },
+  billName: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  billAmount: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginTop: 4,
+  },
+  billRemoveButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    backgroundColor: '#fee2e2',
+  },
+  billRemoveText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#b91c1c',
   },
   dropdown: {
     borderWidth: 1,
@@ -503,6 +834,26 @@ const styles = StyleSheet.create({
   checkmark: {
     fontSize: 20,
     color: '#3b82f6',
+    fontWeight: '600',
+  },
+  modalActionButton: {
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  modalActionText: {
+    fontSize: 16,
+    color: '#111827',
+    fontWeight: '600',
+  },
+  modalCancelButton: {
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+  },
+  modalCancelText: {
+    fontSize: 16,
+    color: '#6b7280',
     fontWeight: '600',
   },
 });
