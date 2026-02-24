@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Image,
   StyleSheet,
@@ -58,7 +58,16 @@ const runOcrViaApi = async (base64Image) => {
   });
 
   if (!response.ok) {
-    throw new Error('OCR API request failed');
+    let errorMessage = 'OCR API request failed';
+    try {
+      const errorBody = await response.json();
+      if (errorBody?.error) {
+        errorMessage = errorBody.error;
+      }
+    } catch (error) {
+      // Ignore JSON parsing errors from non-JSON responses.
+    }
+    throw new Error(errorMessage);
   }
 
   const data = await response.json();
@@ -77,6 +86,9 @@ export default function ExistingLoanDetails({ navigation, route }) {
   const [uploadedDocument, setUploadedDocument] = useState('');
   const [documentPickerModal, setDocumentPickerModal] = useState(false);
   const [uploadedDocumentBase64, setUploadedDocumentBase64] = useState('');
+  const [verificationStatus, setVerificationStatus] = useState('idle');
+  const [verificationMessage, setVerificationMessage] = useState('');
+  const [lastVerifiedSnapshot, setLastVerifiedSnapshot] = useState(null);
   
   const [loanData, setLoanData] = useState({
     loanType: '',
@@ -90,6 +102,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
     { label: 'Personal Loan', value: 'personal' },
     { label: 'Education Loan', value: 'education' },
     { label: 'Home Loan', value: 'home' },
+    { label: 'Mobile Loan', value: 'mobile' },
     { label: 'Vehicle Loan', value: 'vehicle' },
     { label: 'Business Loan', value: 'business' },
     { label: 'Gold Loan', value: 'gold' },
@@ -109,6 +122,126 @@ export default function ExistingLoanDetails({ navigation, route }) {
     const selected = pendingEMIOptions.find(item => item.value === loanData.pendingEMI);
     return selected ? selected.label : 'Select Option';
   };
+
+  const applicantName = useMemo(() => {
+    return (
+      route?.params?.formData?.fullName ||
+      route?.params?.formData?.FullName ||
+      ''
+    );
+  }, [route?.params?.formData]);
+
+  const normalizeText = useCallback((value) => {
+    return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+  }, []);
+
+  const verifyDocument = useCallback(
+    async ({ showAlerts = true, documentUri, documentBase64, amountValue } = {}) => {
+      const activeDocument = documentUri || uploadedDocument;
+      const activeBase64 = documentBase64 || uploadedDocumentBase64;
+      const activeAmount = amountValue ?? loanData.totalLoanAmount;
+
+      if (!activeDocument || !activeBase64) {
+        setVerificationStatus('failed');
+        setVerificationMessage('Please upload a clear loan document.');
+        return false;
+      }
+
+      if (!applicantName) {
+        setVerificationStatus('failed');
+        setVerificationMessage('Applicant name is missing. Please go back and fill it.');
+        return false;
+      }
+
+      if (!activeAmount) {
+        setVerificationStatus('failed');
+        setVerificationMessage('Please enter the total loan amount before verification.');
+        return false;
+      }
+
+      const normalizedName = normalizeText(applicantName);
+      const normalizedAmount = activeAmount.replace(/[^0-9]/g, '');
+
+      const snapshot = `${activeDocument}|${normalizedName}|${normalizedAmount}`;
+      if (lastVerifiedSnapshot === snapshot && verificationStatus === 'success') {
+        return true;
+      }
+
+      setVerificationStatus('verifying');
+      setVerificationMessage('Verifying document...');
+
+      const ocrModule = getOcrModule();
+      let extractedText = '';
+
+      try {
+        if (ocrModule?.recognizeText) {
+          const ocrResult = await ocrModule.recognizeText(activeDocument);
+          extractedText = ocrResult?.text || '';
+        } else {
+          extractedText = await runOcrViaApi(activeBase64);
+        }
+      } catch (error) {
+        console.error('OCR Error:', error);
+        setVerificationStatus('failed');
+        setVerificationMessage(
+          error?.message || 'Could not process the document. Please try again.'
+        );
+        if (showAlerts) {
+          Alert.alert(
+            'Verification Error',
+            error?.message ||
+              'Could not process the document. Please ensure the image is clear and try again.',
+            [{ text: 'OK', style: 'destructive' }]
+          );
+        }
+        return false;
+      }
+
+      const ocrText = normalizeText(extractedText);
+
+      const nameTokens = applicantName
+        .split(/\s+/)
+        .map((token) => normalizeText(token))
+        .filter((token) => token.length > 1);
+
+      const nameMatch =
+        (normalizedName && ocrText.includes(normalizedName)) ||
+        (nameTokens.length > 0 && nameTokens.every((token) => ocrText.includes(token)));
+
+      const amountMatch = normalizedAmount && ocrText.includes(normalizedAmount);
+
+      if (!nameMatch || !amountMatch) {
+        setVerificationStatus('failed');
+        setVerificationMessage('Document verification failed. Name or amount not matched.');
+        if (showAlerts) {
+          Alert.alert(
+            'Document Verification Failed',
+            'Name or amount not matched. Please upload a valid loan document.',
+            [{ text: 'OK', style: 'destructive' }]
+          );
+        }
+        return false;
+      }
+
+      setVerificationStatus('success');
+      setVerificationMessage('Document verified successfully.');
+      setLastVerifiedSnapshot(snapshot);
+      if (showAlerts) {
+        Alert.alert('Verification Success', 'Name and amount matched.', [{ text: 'OK' }]);
+      }
+      return true;
+    },
+    [
+      applicantName,
+      lastVerifiedSnapshot,
+      loanData.totalLoanAmount,
+      normalizeText,
+      loanData.totalLoanAmount,
+      uploadedDocument,
+      uploadedDocumentBase64,
+      verificationStatus,
+    ]
+  );
 
   const handleNext = async () => {
     // If user has no existing loan, proceed to next page
@@ -130,10 +263,6 @@ export default function ExistingLoanDetails({ navigation, route }) {
       return;
     }
 
-    const applicantName =
-      route?.params?.formData?.fullName ||
-      route?.params?.formData?.FullName ||
-      '';
     if (!applicantName) {
       Alert.alert('Error', 'Applicant name is missing. Please go back and fill it.');
       return;
@@ -144,78 +273,10 @@ export default function ExistingLoanDetails({ navigation, route }) {
       return;
     }
 
-    const normalizeText = (value) =>
-      value.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-    const normalizedName = normalizeText(applicantName);
-    const normalizedAmount = loanData.totalLoanAmount.replace(/[^0-9]/g, '');
-
-    // Document verification with OCR (native or API fallback)
-    const ocrModule = getOcrModule();
-    let extractedText = '';
-
-    try {
-      if (ocrModule?.recognizeText) {
-        console.log('Starting native OCR verification...');
-        const ocrResult = await ocrModule.recognizeText(uploadedDocument);
-        extractedText = ocrResult?.text || '';
-      } else {
-        console.log('Starting OCR API verification...');
-        extractedText = await runOcrViaApi(uploadedDocumentBase64);
-      }
-    } catch (error) {
-      console.error('OCR Error:', error);
-      Alert.alert(
-        'Verification Error',
-        'Could not process the document. Please ensure the image is clear and try again.',
-        [{ text: 'OK', style: 'destructive' }]
-      );
+    const isVerified = await verifyDocument({ showAlerts: true });
+    if (!isVerified) {
       return;
     }
-
-    const ocrText = normalizeText(extractedText);
-
-    // Verify applicant name
-    const nameTokens = applicantName
-      .split(/\s+/)
-      .map((token) => normalizeText(token))
-      .filter((token) => token.length > 1);
-
-    const nameMatch =
-      (normalizedName && ocrText.includes(normalizedName)) ||
-      (nameTokens.length > 0 && nameTokens.every((token) => ocrText.includes(token)));
-
-    // Verify loan amount
-    const amountMatch = normalizedAmount && ocrText.includes(normalizedAmount);
-
-    if (!nameMatch && !amountMatch) {
-      Alert.alert(
-        'Document Verification Failed',
-        'The uploaded document does not contain your name or loan amount. Please upload a valid loan document.',
-        [{ text: 'OK', style: 'destructive' }]
-      );
-      return;
-    }
-
-    if (!nameMatch) {
-      Alert.alert(
-        'Name Verification Failed',
-        `The document does not contain the applicant name "${applicantName}". Please upload a document with your name.`,
-        [{ text: 'OK', style: 'destructive' }]
-      );
-      return;
-    }
-
-    if (!amountMatch) {
-      Alert.alert(
-        'Amount Verification Failed',
-        `The document does not contain the loan amount ₹${loanData.totalLoanAmount}. Please upload a valid loan document.`,
-        [{ text: 'OK', style: 'destructive' }]
-      );
-      return;
-    }
-
-    console.log('Document verified successfully');
 
     // Check if user has pending EMI
     if (loanData.pendingEMI === 'yes') {
@@ -279,9 +340,17 @@ export default function ExistingLoanDetails({ navigation, route }) {
     });
 
     if (!result.canceled && result.assets?.length) {
-      setUploadedDocument(result.assets[0].uri);
-      setUploadedDocumentBase64(result.assets[0].base64 || '');
+      const pickedUri = result.assets[0].uri;
+      const pickedBase64 = result.assets[0].base64 || '';
+      setUploadedDocument(pickedUri);
+      setUploadedDocumentBase64(pickedBase64);
       setDocumentPickerModal(false);
+      await verifyDocument({
+        showAlerts: true,
+        documentUri: pickedUri,
+        documentBase64: pickedBase64,
+        amountValue: loanData.totalLoanAmount,
+      });
     }
   };
 
@@ -300,11 +369,40 @@ export default function ExistingLoanDetails({ navigation, route }) {
     });
 
     if (!result.canceled && result.assets?.length) {
-      setUploadedDocument(result.assets[0].uri);
-      setUploadedDocumentBase64(result.assets[0].base64 || '');
+      const pickedUri = result.assets[0].uri;
+      const pickedBase64 = result.assets[0].base64 || '';
+      setUploadedDocument(pickedUri);
+      setUploadedDocumentBase64(pickedBase64);
       setDocumentPickerModal(false);
+      await verifyDocument({
+        showAlerts: true,
+        documentUri: pickedUri,
+        documentBase64: pickedBase64,
+        amountValue: loanData.totalLoanAmount,
+      });
     }
   };
+
+  useEffect(() => {
+    if (!uploadedDocument || !uploadedDocumentBase64) {
+      return;
+    }
+
+    if (!loanData.totalLoanAmount) {
+      return;
+    }
+
+    const debounceId = setTimeout(() => {
+      verifyDocument({ showAlerts: false });
+    }, 500);
+
+    return () => clearTimeout(debounceId);
+  }, [
+    loanData.totalLoanAmount,
+    uploadedDocument,
+    uploadedDocumentBase64,
+    verifyDocument,
+  ]);
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -419,6 +517,17 @@ export default function ExistingLoanDetails({ navigation, route }) {
                     <Text style={styles.uploadHint}>
                       {uploadedDocument ? 'Attached: 1 photo selected' : 'No document uploaded'}
                     </Text>
+                    {verificationStatus !== 'idle' && (
+                      <Text
+                        style={[
+                          styles.verificationStatusText,
+                          verificationStatus === 'success' && styles.verificationStatusSuccess,
+                          verificationStatus === 'failed' && styles.verificationStatusFailed,
+                        ]}
+                      >
+                        {verificationMessage}
+                      </Text>
+                    )}
                     {uploadedDocument ? (
                       <Image
                         source={{ uri: uploadedDocument }}
@@ -741,6 +850,18 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontSize: 12,
     color: '#6b7280',
+  },
+  verificationStatusText: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  verificationStatusSuccess: {
+    color: '#15803d',
+  },
+  verificationStatusFailed: {
+    color: '#b91c1c',
   },
   documentPreview: {
     marginTop: 12,

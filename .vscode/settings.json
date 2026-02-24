@@ -1,0 +1,4 @@
+{
+  "typescript.tsserver.exclude": ["**/node_modules/**"],
+  "javascript.implicitProjectConfig.checkJs": false
+}
