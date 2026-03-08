@@ -102,7 +102,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
     { label: 'Personal Loan', value: 'personal' },
     { label: 'Education Loan', value: 'education' },
     { label: 'Home Loan', value: 'home' },
-    { label: 'Mobile Loan', value: 'mobile' },
+    { label: 'Gadgets Loan', value: 'gadgets' },
     { label: 'Vehicle Loan', value: 'vehicle' },
     { label: 'Business Loan', value: 'business' },
     { label: 'Gold Loan', value: 'gold' },
