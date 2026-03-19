@@ -70,6 +70,96 @@ app.post('/ocr', async (req, res) => {
   }
 });
 
+const normalizeText = (value = '') => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const detectSuspiciousLayout = (text = '') => {
+  const compact = text.replace(/\s+/g, '');
+  if (!compact) {
+    return true;
+  }
+
+  const repeatedPattern = /(.)\1{6,}/.test(compact);
+  const symbolRatio = (compact.match(/[^a-zA-Z0-9]/g) || []).length / compact.length;
+  return repeatedPattern || symbolRatio > 0.35;
+};
+
+const hasWatermarkSignals = (text = '') => {
+  const normalized = normalizeText(text);
+  const suspiciousMarkers = ['samplecopy', 'duplicatecopy', 'fortrainingonly', 'notvalid'];
+  return suspiciousMarkers.some((marker) => normalized.includes(marker));
+};
+
+const extractNumericCandidates = (text = '') => {
+  return text
+    .replace(/,/g, '')
+    .match(/\d{4,}/g) || [];
+};
+
+app.post('/validate-document', (req, res) => {
+  try {
+    const { documentType, extractedText, userDetails } = req.body || {};
+
+    if (!documentType || typeof extractedText !== 'string') {
+      return res.status(400).json({ error: 'documentType and extractedText are required' });
+    }
+
+    const cleanedText = extractedText.trim();
+    const normalizedText = normalizeText(cleanedText);
+    const normalizedName = normalizeText(userDetails?.name || '');
+    const incomeValue = String(userDetails?.income || '').replace(/[^0-9]/g, '');
+    const issues = [];
+
+    if (!cleanedText || cleanedText.length < 30) {
+      issues.push('Very little readable content. OCR text is insufficient.');
+    }
+
+    if (hasWatermarkSignals(cleanedText)) {
+      issues.push('Possible watermark inconsistency detected in OCR text.');
+    }
+
+    if (detectSuspiciousLayout(cleanedText)) {
+      issues.push('Font/layout irregularity detected by text pattern check.');
+    }
+
+    if (normalizedName) {
+      const nameTokens = normalizedName.split(/\s+/).filter(Boolean);
+      const nameMatch = normalizedText.includes(normalizedName)
+        || nameTokens.every((token) => normalizedText.includes(token));
+      if (!nameMatch) {
+        issues.push('Name does not match provided applicant details.');
+      }
+    }
+
+    if (normalizeText(documentType).includes('salaryslip') && incomeValue) {
+      const numericCandidates = extractNumericCandidates(cleanedText);
+      if (!numericCandidates.some((value) => value.includes(incomeValue))) {
+        issues.push('Income mismatch in salary slip validation.');
+      }
+    }
+
+    const criticalIssue = issues.some((issue) =>
+      issue.includes('Name does not match')
+      || issue.includes('Income mismatch')
+      || issue.includes('insufficient')
+    );
+
+    const status = criticalIssue || issues.length >= 3 ? 'Tampered Document' : 'Original Document';
+    return res.status(200).json({
+      status,
+      message: status === 'Original Document' ? 'Document passed AI checks.' : issues.join(' '),
+      checks: {
+        watermark: !issues.some((issue) => issue.includes('watermark')),
+        layout: !issues.some((issue) => issue.includes('layout')),
+        tampering: status === 'Original Document',
+      },
+      issues,
+    });
+  } catch (error) {
+    console.error('Validation server error:', error.message);
+    return res.status(500).json({ error: 'Validation server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
