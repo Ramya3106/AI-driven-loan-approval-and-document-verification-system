@@ -23,15 +23,82 @@ const DOCUMENT_TYPES = [
   { key: 'addressProof', label: 'Address Proof' },
 ];
 
+const OCR_TIMEOUT_MS = 45000;
+const VALIDATION_TIMEOUT_MS = 10000;
+const LOCAL_OCR_TIMEOUT_MS = 15000;
+const IS_EXPO_GO =
+  Constants.appOwnership === 'expo' || Constants.executionEnvironment === 'storeClient';
+
+const sanitizeBaseUrl = (value: string) => (value || '').trim().replace(/\/+$/, '');
+
 const getApiBaseUrl = () => {
+  const manualBaseUrl = sanitizeBaseUrl(
+    String(Constants.expoConfig?.extra?.apiBaseUrl || Constants.manifest?.extra?.apiBaseUrl || '')
+  );
+
+  if (manualBaseUrl) {
+    return manualBaseUrl;
+  }
+
   const hostUri =
     Constants.expoConfig?.hostUri ||
+    Constants.expoConfig?.extra?.expoClient?.hostUri ||
     Constants.manifest2?.extra?.expoClient?.hostUri ||
+    Constants.manifest?.debuggerHost ||
     Constants.manifest?.hostUri ||
     '';
 
-  const host = hostUri ? hostUri.split(':')[0] : 'localhost';
-  return `http://${host}:5000`;
+  const host = hostUri
+    ? hostUri.split(':')[0]
+    : Platform.OS === 'android'
+      ? '10.0.2.2'
+      : 'localhost';
+  return sanitizeBaseUrl(`http://${host}:5000`);
+};
+
+const withTimeout = async (url: string, options: any, timeoutMs: number, fallbackMessage: string) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(fallbackMessage);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const withPromiseTimeout = async <T,>(workPromise: Promise<T>, timeoutMs: number, fallbackMessage: string) => {
+  let timer: any;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(fallbackMessage)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([workPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const loadOptionalLocalOcrModule = async () => {
+  if (IS_EXPO_GO) {
+    return null;
+  }
+
+  try {
+    const moduleRef: any = await import('expo-mlkit-ocr');
+    return moduleRef?.default || moduleRef;
+  } catch (error) {
+    return null;
+  }
 };
 
 const requestGalleryPermission = async () => {
@@ -42,13 +109,18 @@ const requestGalleryPermission = async () => {
 const normalizeText = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const runOcrViaApi = async (base64Image: string) => {
-  const response = await fetch(`${getApiBaseUrl()}/ocr`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  const response = await withTimeout(
+    `${getApiBaseUrl()}/ocr`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ base64Image }),
     },
-    body: JSON.stringify({ base64Image }),
-  });
+    OCR_TIMEOUT_MS,
+    'OCR timed out after 45 seconds. Please retry with a clearer image.'
+  );
 
   if (!response.ok) {
     let errorMessage = 'OCR request failed';
@@ -67,14 +139,50 @@ const runOcrViaApi = async (base64Image: string) => {
   return data?.text || '';
 };
 
+const runLocalOcr = async (imageUri: string) => {
+  const localOcrModule = await loadOptionalLocalOcrModule();
+  if (!localOcrModule?.recognizeText) {
+    throw new Error('Local OCR module unavailable.');
+  }
+
+  const result: any = await withPromiseTimeout(
+    localOcrModule.recognizeText(imageUri),
+    LOCAL_OCR_TIMEOUT_MS,
+    'Local OCR timed out.'
+  );
+  return result?.text || '';
+};
+
+const runBestEffortOcr = async ({ imageUri, base64Image }: { imageUri: string; base64Image: string }) => {
+  try {
+    const localText = await runLocalOcr(imageUri);
+    if (localText && localText.trim().length >= 20) {
+      return localText.trim();
+    }
+  } catch (error) {
+    // Fall back to server OCR when local OCR fails on current runtime/device.
+  }
+
+  if (!base64Image) {
+    throw new Error('Unable to extract text from image. Please retry with a clearer image.');
+  }
+
+  return runOcrViaApi(base64Image);
+};
+
 const runAiValidation = async ({ documentType, extractedText, userDetails }: any) => {
-  const response = await fetch(`${getApiBaseUrl()}/validate-document`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  const response = await withTimeout(
+    `${getApiBaseUrl()}/validate-document`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ documentType, extractedText, userDetails }),
     },
-    body: JSON.stringify({ documentType, extractedText, userDetails }),
-  });
+    VALIDATION_TIMEOUT_MS,
+    'Validation timed out. Please retry.'
+  );
 
   if (!response.ok) {
     let errorMessage = 'Validation request failed';
@@ -113,6 +221,8 @@ export default function DocumentUploadPage({ navigation, route }: any) {
     return {
       name: formData.fullName || formData.FullName || '',
       income: formData.monthlyIncome || formData.annualIncome || '',
+      monthlyIncome: formData.monthlyIncome || '',
+      annualIncome: formData.annualIncome || '',
       cibilScore: formData.cibilScore || '',
       loanAmount: formData.loanAmount || '',
       hasExistingLoan: route?.params?.hasExistingLoan,
@@ -151,7 +261,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
     const imageResult = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.8,
+      quality: 0.5,
       base64: true,
       selectionLimit: 1,
     });
@@ -181,7 +291,10 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         throw new Error('No base64 data found. Please pick a clearer image.');
       }
 
-      const extractedText = await runOcrViaApi(selectedBase64);
+      const extractedText = await runBestEffortOcr({
+        imageUri: selected.uri,
+        base64Image: selectedBase64,
+      });
       const aiResult = await runAiValidation({
         documentType: label,
         extractedText,
