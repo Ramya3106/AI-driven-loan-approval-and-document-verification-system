@@ -15,25 +15,96 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import Constants from 'expo-constants';
 
+const OCR_TIMEOUT_MS = 45000;
+const LOCAL_OCR_TIMEOUT_MS = 15000;
+const IS_EXPO_GO =
+  Constants.appOwnership === 'expo' || Constants.executionEnvironment === 'storeClient';
+
+const sanitizeBaseUrl = (value) => (value || '').trim().replace(/\/+$/, '');
+
 const getApiBaseUrl = () => {
+  const manualBaseUrl = sanitizeBaseUrl(
+    String(Constants.expoConfig?.extra?.apiBaseUrl || Constants.manifest?.extra?.apiBaseUrl || '')
+  );
+
+  if (manualBaseUrl) {
+    return manualBaseUrl;
+  }
+
   const hostUri =
     Constants.expoConfig?.hostUri ||
+    Constants.expoConfig?.extra?.expoClient?.hostUri ||
     Constants.manifest2?.extra?.expoClient?.hostUri ||
+    Constants.manifest?.debuggerHost ||
     Constants.manifest?.hostUri ||
     '';
 
-  const host = hostUri ? hostUri.split(':')[0] : 'localhost';
-  return `http://${host}:5000`;
+  const host = hostUri
+    ? hostUri.split(':')[0]
+    : Platform.OS === 'android'
+      ? '10.0.2.2'
+      : 'localhost';
+  return sanitizeBaseUrl(`http://${host}:5000`);
+};
+
+const withTimeout = async (url, options, timeoutMs, fallbackMessage) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(fallbackMessage);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const withPromiseTimeout = async (workPromise, timeoutMs, fallbackMessage) => {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(fallbackMessage)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([workPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const loadOptionalLocalOcrModule = async () => {
+  if (IS_EXPO_GO) {
+    return null;
+  }
+
+  try {
+    const moduleRef = await import('expo-mlkit-ocr');
+    return moduleRef?.default || moduleRef;
+  } catch (error) {
+    return null;
+  }
 };
 
 const normalizeText = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const runOcrViaApi = async (base64Image) => {
-  const response = await fetch(`${getApiBaseUrl()}/ocr`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ base64Image }),
-  });
+  const response = await withTimeout(
+    `${getApiBaseUrl()}/ocr`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base64Image }),
+    },
+    OCR_TIMEOUT_MS,
+    'OCR timed out after 45 seconds. Please retry with a clearer image.'
+  );
 
   if (!response.ok) {
     let errorMessage = 'OCR request failed';
@@ -50,6 +121,37 @@ const runOcrViaApi = async (base64Image) => {
 
   const data = await response.json();
   return data?.text || '';
+};
+
+const runLocalOcr = async (imageUri) => {
+  const localOcrModule = await loadOptionalLocalOcrModule();
+  if (!localOcrModule?.recognizeText) {
+    throw new Error('Local OCR module unavailable.');
+  }
+
+  const result = await withPromiseTimeout(
+    localOcrModule.recognizeText(imageUri),
+    LOCAL_OCR_TIMEOUT_MS,
+    'Local OCR timed out.'
+  );
+  return result?.text || '';
+};
+
+const runBestEffortOcr = async ({ imageUri, base64Image }) => {
+  try {
+    const localText = await runLocalOcr(imageUri);
+    if (localText && localText.trim().length >= 20) {
+      return localText.trim();
+    }
+  } catch (error) {
+    // Fall back to server OCR when local OCR fails on current runtime/device.
+  }
+
+  if (!base64Image) {
+    throw new Error('Unable to extract text from image. Please retry with a clearer image.');
+  }
+
+  return runOcrViaApi(base64Image);
 };
 
 export default function ExistingLoanDetails({ navigation, route }) {
@@ -94,7 +196,10 @@ export default function ExistingLoanDetails({ navigation, route }) {
     setVerificationMessage('Verifying document...');
 
     try {
-      const extractedText = await runOcrViaApi(uploadedDocumentBase64);
+      const extractedText = await runBestEffortOcr({
+        imageUri: uploadedDocument,
+        base64Image: uploadedDocumentBase64,
+      });
       const normalizedText = normalizeText(extractedText);
       const normalizedName = normalizeText(applicantName);
       const normalizedAmount = loanData.totalLoanAmount.replace(/[^0-9]/g, '');
@@ -134,7 +239,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.8,
+      quality: 0.5,
       selectionLimit: 1,
       base64: true,
     });
