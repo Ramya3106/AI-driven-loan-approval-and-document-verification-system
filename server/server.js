@@ -37,19 +37,57 @@ app.post('/ocr', async (req, res) => {
     body.append('isOverlayRequired', 'false');
     body.append('base64Image', `data:image/jpg;base64,${base64Image}`);
 
-    const response = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: body.toString(),
-    });
+    const tryOcrEndpoint = async (endpoint) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 45000);
 
-    if (!response.ok) {
-      return res.status(502).json({ error: 'OCR API request failed' });
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: body.toString(),
+          signal: controller.signal,
+        });
+
+        let payload = null;
+        try {
+          payload = await response.json();
+        } catch (parseError) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          return {
+            ok: false,
+            error:
+              payload?.ErrorMessage || payload?.error || `OCR API request failed (${response.status})`,
+          };
+        }
+
+        return { ok: true, payload };
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          return { ok: false, error: 'OCR timed out after 45 seconds' };
+        }
+
+        return { ok: false, error: error?.message || 'OCR provider call failed' };
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    const primaryResult = await tryOcrEndpoint('https://api.ocr.space/parse/image');
+    const finalResult = primaryResult.ok
+      ? primaryResult
+      : await tryOcrEndpoint('https://apipro1.ocr.space/parse/image');
+
+    if (!finalResult.ok) {
+      return res.status(502).json({ error: finalResult.error || 'OCR API request failed' });
     }
 
-    const data = await response.json();
+    const data = finalResult.payload;
     if (data?.IsErroredOnProcessing) {
       return res.status(422).json({ error: data?.ErrorMessage || 'OCR processing error' });
     }
@@ -220,6 +258,59 @@ const extractNumericCandidates = (text = '') => {
     .match(/\d{4,}/g) || [];
 };
 
+const toPositiveNumber = (value = '') => {
+  const digitsOnly = String(value).replace(/[^0-9]/g, '');
+  const parsed = Number(digitsOnly);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+const evaluateSalaryIncomeMatch = ({ text = '', expectedValues = [] }) => {
+  const normalized = normalizeWithSpaces(text);
+  const salaryKeywords = ['salary', 'payslip', 'ctc', 'annual', 'monthly', 'gross', 'net'];
+  const hasSalaryContext = salaryKeywords.some((keyword) => normalized.includes(keyword));
+
+  const numericCandidates = extractNumericCandidates(text)
+    .map((value) => toPositiveNumber(value))
+    .filter((value) => value >= 1000 && !(value >= 1900 && value <= 2100));
+
+  if (!expectedValues.length || !numericCandidates.length) {
+    return { outcome: 'inconclusive' };
+  }
+
+  const expectedList = expectedValues.filter((value) => value > 0);
+  const hasMatch = numericCandidates.some((candidate) =>
+    expectedList.some((expected) => {
+      const tolerance = Math.max(200, Math.round(expected * 0.05));
+      const directMatch = Math.abs(candidate - expected) <= tolerance;
+
+      // OCR sometimes drops/adds a trailing zero (e.g. 600000 -> 60000).
+      const oneZeroScaleMatch =
+        Math.abs(candidate * 10 - expected) <= tolerance
+        || Math.abs(candidate - expected * 10) <= tolerance;
+
+      return directMatch || oneZeroScaleMatch;
+    })
+  );
+
+  if (hasMatch) {
+    return { outcome: 'matched' };
+  }
+
+  const hasConflictingAmount = numericCandidates.some((candidate) =>
+    expectedList.some((expected) => {
+      const tolerance = Math.max(200, Math.round(expected * 0.05));
+      const ratio = candidate / expected;
+      return ratio >= 0.5 && ratio <= 2 && Math.abs(candidate - expected) > tolerance;
+    })
+  );
+
+  if (!hasSalaryContext || !hasConflictingAmount) {
+    return { outcome: 'inconclusive' };
+  }
+
+  return { outcome: 'mismatch' };
+};
+
 app.post('/validate-document', (req, res) => {
   try {
     const { documentType, extractedText, userDetails } = req.body || {};
@@ -231,7 +322,8 @@ app.post('/validate-document', (req, res) => {
     const cleanedText = extractedText.trim();
     const normalizedText = normalizeText(cleanedText);
     const applicantName = String(userDetails?.name || '');
-    const incomeValue = String(userDetails?.income || '').replace(/[^0-9]/g, '');
+    const monthlyIncome = toPositiveNumber(userDetails?.monthlyIncome || userDetails?.income);
+    const annualIncome = toPositiveNumber(userDetails?.annualIncome) || (monthlyIncome ? monthlyIncome * 12 : 0);
     const issues = [];
 
     if (!cleanedText || cleanedText.length < 30) {
@@ -251,9 +343,23 @@ app.post('/validate-document', (req, res) => {
       issues.push(nameValidation.reason);
     }
 
-    if (normalizeText(documentType).includes('salaryslip') && incomeValue) {
-      const numericCandidates = extractNumericCandidates(cleanedText);
-      if (!numericCandidates.some((value) => value.includes(incomeValue))) {
+    let incomeCheck = 'not_applicable';
+    if (normalizeText(documentType).includes('salaryslip') && (annualIncome || monthlyIncome)) {
+      const expectedIncomeValues = [];
+      if (annualIncome) {
+        expectedIncomeValues.push(annualIncome);
+      }
+      if (monthlyIncome) {
+        expectedIncomeValues.push(monthlyIncome);
+      }
+
+      const incomeEvaluation = evaluateSalaryIncomeMatch({
+        text: cleanedText,
+        expectedValues: expectedIncomeValues,
+      });
+
+      incomeCheck = incomeEvaluation.outcome;
+      if (incomeEvaluation.outcome === 'mismatch') {
         issues.push('Income mismatch in salary slip validation.');
       }
     }
@@ -271,6 +377,7 @@ app.post('/validate-document', (req, res) => {
       checks: {
         name: nameValidation.isMatch,
         nameConfidence: nameValidation.confidence,
+        income: incomeCheck,
         watermark: !issues.some((issue) => issue.includes('watermark')),
         layout: !issues.some((issue) => issue.includes('layout')),
         tampering: status === 'Original',
