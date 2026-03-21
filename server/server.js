@@ -72,6 +72,131 @@ app.post('/ocr', async (req, res) => {
 
 const normalizeText = (value = '') => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 
+const normalizeWithSpaces = (value = '') =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const tokenizeName = (value = '') =>
+  normalizeWithSpaces(value)
+    .split(' ')
+    .filter((token) => token.length > 1);
+
+const levenshteinDistance = (left = '', right = '') => {
+  if (!left) {
+    return right.length;
+  }
+  if (!right) {
+    return left.length;
+  }
+
+  const rows = left.length + 1;
+  const cols = right.length + 1;
+  const matrix = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+  for (let row = 0; row < rows; row += 1) {
+    matrix[row][0] = row;
+  }
+  for (let col = 0; col < cols; col += 1) {
+    matrix[0][col] = col;
+  }
+
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      const substitutionCost = left[row - 1] === right[col - 1] ? 0 : 1;
+      matrix[row][col] = Math.min(
+        matrix[row - 1][col] + 1,
+        matrix[row][col - 1] + 1,
+        matrix[row - 1][col - 1] + substitutionCost
+      );
+    }
+  }
+
+  return matrix[rows - 1][cols - 1];
+};
+
+const isTokenMatch = (expectedToken = '', candidateToken = '') => {
+  if (!expectedToken || !candidateToken) {
+    return false;
+  }
+
+  if (expectedToken === candidateToken) {
+    return true;
+  }
+
+  const distance = levenshteinDistance(expectedToken, candidateToken);
+  const allowance = expectedToken.length >= 7 ? 2 : 1;
+  return distance <= allowance;
+};
+
+const findBestWindowSimilarity = (expectedTokens = [], extractedTokens = []) => {
+  if (!expectedTokens.length || !extractedTokens.length) {
+    return 0;
+  }
+
+  const windowSize = expectedTokens.length;
+  if (extractedTokens.length < windowSize) {
+    const expectedJoined = expectedTokens.join('');
+    const extractedJoined = extractedTokens.join('');
+    const distance = levenshteinDistance(expectedJoined, extractedJoined);
+    return 1 - distance / Math.max(expectedJoined.length, extractedJoined.length, 1);
+  }
+
+  const expectedJoined = expectedTokens.join('');
+  let bestSimilarity = 0;
+
+  for (let index = 0; index <= extractedTokens.length - windowSize; index += 1) {
+    const windowJoined = extractedTokens.slice(index, index + windowSize).join('');
+    const distance = levenshteinDistance(expectedJoined, windowJoined);
+    const similarity = 1 - distance / Math.max(expectedJoined.length, windowJoined.length, 1);
+    if (similarity > bestSimilarity) {
+      bestSimilarity = similarity;
+    }
+  }
+
+  return bestSimilarity;
+};
+
+const verifyNameMatch = (applicantName = '', extractedText = '') => {
+  const expectedTokens = tokenizeName(applicantName);
+  if (!expectedTokens.length) {
+    return {
+      isMatch: false,
+      reason: 'Applicant name is missing from provided details.',
+      confidence: 0,
+    };
+  }
+
+  const extractedTokens = tokenizeName(extractedText);
+  if (!extractedTokens.length) {
+    return {
+      isMatch: false,
+      reason: 'Unable to read a valid name from OCR text.',
+      confidence: 0,
+    };
+  }
+
+  const matchedTokenCount = expectedTokens.filter((expectedToken) =>
+    extractedTokens.some((candidateToken) => isTokenMatch(expectedToken, candidateToken))
+  ).length;
+
+  const tokenCoverage = matchedTokenCount / expectedTokens.length;
+  const fullNameSimilarity = findBestWindowSimilarity(expectedTokens, extractedTokens);
+
+  const isMatch = tokenCoverage === 1 || (tokenCoverage >= 0.67 && fullNameSimilarity >= 0.82);
+  const confidence = Number((tokenCoverage * 0.6 + fullNameSimilarity * 0.4).toFixed(2));
+
+  return {
+    isMatch,
+    confidence,
+    reason: isMatch
+      ? 'Applicant name matched with OCR output.'
+      : 'Name extracted from OCR does not match the provided applicant name.',
+  };
+};
+
 const detectSuspiciousLayout = (text = '') => {
   const compact = text.replace(/\s+/g, '');
   if (!compact) {
@@ -105,7 +230,7 @@ app.post('/validate-document', (req, res) => {
 
     const cleanedText = extractedText.trim();
     const normalizedText = normalizeText(cleanedText);
-    const normalizedName = normalizeText(userDetails?.name || '');
+    const applicantName = String(userDetails?.name || '');
     const incomeValue = String(userDetails?.income || '').replace(/[^0-9]/g, '');
     const issues = [];
 
@@ -121,13 +246,9 @@ app.post('/validate-document', (req, res) => {
       issues.push('Font/layout irregularity detected by text pattern check.');
     }
 
-    if (normalizedName) {
-      const nameTokens = normalizedName.split(/\s+/).filter(Boolean);
-      const nameMatch = normalizedText.includes(normalizedName)
-        || nameTokens.every((token) => normalizedText.includes(token));
-      if (!nameMatch) {
-        issues.push('Name does not match provided applicant details.');
-      }
+    const nameValidation = verifyNameMatch(applicantName, cleanedText);
+    if (!nameValidation.isMatch) {
+      issues.push(nameValidation.reason);
     }
 
     if (normalizeText(documentType).includes('salaryslip') && incomeValue) {
@@ -138,19 +259,21 @@ app.post('/validate-document', (req, res) => {
     }
 
     const criticalIssue = issues.some((issue) =>
-      issue.includes('Name does not match')
+      issue.includes('does not match')
       || issue.includes('Income mismatch')
       || issue.includes('insufficient')
     );
 
-    const status = criticalIssue || issues.length >= 3 ? 'Tampered Document' : 'Original Document';
+    const status = criticalIssue || issues.length >= 3 ? 'Tampered' : 'Original';
     return res.status(200).json({
       status,
-      message: status === 'Original Document' ? 'Document passed AI checks.' : issues.join(' '),
+      message: status === 'Original' ? 'Document passed AI checks.' : issues.join(' '),
       checks: {
+        name: nameValidation.isMatch,
+        nameConfidence: nameValidation.confidence,
         watermark: !issues.some((issue) => issue.includes('watermark')),
         layout: !issues.some((issue) => issue.includes('layout')),
-        tampering: status === 'Original Document',
+        tampering: status === 'Original',
       },
       issues,
     });
