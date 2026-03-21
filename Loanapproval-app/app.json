@@ -16,6 +16,9 @@
     "android": {
       "edgeToEdgeEnabled": true,
       "package": "com.anonymous.Loanapprovalapp"
+    },
+    "extra": {
+      "apiBaseUrl": "http://10.236.199.242:5000"
     }
   }
 }
