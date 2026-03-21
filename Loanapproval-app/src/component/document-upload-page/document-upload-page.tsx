@@ -188,13 +188,18 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         userDetails,
       });
 
-      const isOriginal = normalizeText(aiResult?.status).includes('original');
+      const statusText = normalizeText(aiResult?.status);
+      const isNameMatched = aiResult?.checks?.name !== false;
+      const isOriginal = statusText === 'original' && isNameMatched;
+
+      const failureMessage = !isNameMatched
+        ? 'Name mismatch with provided application details.'
+        : aiResult?.message || 'Tampered Document';
+
       updateDocument(key, {
         extractedText,
         status: isOriginal ? 'verified' : 'tampered',
-        statusText: isOriginal
-          ? 'Original Document'
-          : aiResult?.message || 'Tampered Document',
+        statusText: isOriginal ? 'Original' : failureMessage,
         progress: 100,
       });
     } catch (error: any) {
