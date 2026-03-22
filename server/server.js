@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const fetch = require('node-fetch');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -25,21 +26,56 @@ app.get('/health', (req, res) => {
 
 app.post('/ocr', async (req, res) => {
   try {
-    const { base64Image } = req.body || {};
+    const { base64Image, documentType } = req.body || {};
     if (!base64Image) {
       return res.status(400).json({ error: 'Missing base64Image' });
     }
 
     const apiKey = process.env.OCR_SPACE_API_KEY || 'helloworld';
-    const body = new URLSearchParams();
-    body.append('apikey', apiKey);
-    body.append('language', 'eng');
-    body.append('isOverlayRequired', 'false');
-    body.append('base64Image', `data:image/jpg;base64,${base64Image}`);
 
-    const tryOcrEndpoint = async (endpoint) => {
+    const scoreOcrText = (text = '', docTypeLabel = '') => {
+      const compact = normalizeText(text);
+      if (!compact) {
+        return 0;
+      }
+
+      let score = compact.length;
+      const panRegex = /[A-Z]{5}[0-9]{4}[A-Z]/i;
+      const hasPanNumber = panRegex.test(text);
+      if (hasPanNumber) {
+        score += 120;
+      }
+
+      const docTypeKey = normalizeText(String(docTypeLabel));
+      if (docTypeKey.includes('pancard')) {
+        if (/income\s*tax/i.test(text)) {
+          score += 35;
+        }
+        if (/permanent\s*account\s*number/i.test(text)) {
+          score += 50;
+        }
+      }
+
+      return score;
+    };
+
+    const buildBody = ({ ocrEngine = '2', detectOrientation = 'true', scale = 'true' }) => {
+      const body = new URLSearchParams();
+      body.append('apikey', apiKey);
+      body.append('language', 'eng');
+      body.append('isOverlayRequired', 'false');
+      body.append('OCREngine', ocrEngine);
+      body.append('detectOrientation', detectOrientation);
+      body.append('scale', scale);
+      body.append('base64Image', `data:image/jpg;base64,${base64Image}`);
+      return body;
+    };
+
+    const OCR_ATTEMPT_TIMEOUT_MS = 12000;
+
+    const tryOcrEndpoint = async (endpoint, body) => {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 45000);
+      const timeout = setTimeout(() => controller.abort(), OCR_ATTEMPT_TIMEOUT_MS);
 
       try {
         const response = await fetch(endpoint, {
@@ -69,7 +105,7 @@ app.post('/ocr', async (req, res) => {
         return { ok: true, payload };
       } catch (error) {
         if (error?.name === 'AbortError') {
-          return { ok: false, error: 'OCR timed out after 45 seconds' };
+          return { ok: false, error: `OCR provider timed out after ${OCR_ATTEMPT_TIMEOUT_MS / 1000} seconds` };
         }
 
         return { ok: false, error: error?.message || 'OCR provider call failed' };
@@ -78,24 +114,65 @@ app.post('/ocr', async (req, res) => {
       }
     };
 
-    const primaryResult = await tryOcrEndpoint('https://api.ocr.space/parse/image');
-    const finalResult = primaryResult.ok
-      ? primaryResult
-      : await tryOcrEndpoint('https://apipro1.ocr.space/parse/image');
+    const isPanCard = normalizeText(String(documentType)).includes('pancard');
+    const requestProfiles = isPanCard
+      ? [
+        buildBody({ ocrEngine: '2', detectOrientation: 'true', scale: 'true' }),
+        buildBody({ ocrEngine: '1', detectOrientation: 'true', scale: 'true' }),
+        buildBody({ ocrEngine: '2', detectOrientation: 'true', scale: 'false' }),
+      ]
+      : [
+        buildBody({ ocrEngine: '2', detectOrientation: 'true', scale: 'true' }),
+        buildBody({ ocrEngine: '1', detectOrientation: 'true', scale: 'true' }),
+      ];
 
-    if (!finalResult.ok) {
-      return res.status(502).json({ error: finalResult.error || 'OCR API request failed' });
+    const endpoints = ['https://api.ocr.space/parse/image', 'https://apipro1.ocr.space/parse/image'];
+    const candidates = [];
+    let bestCandidate = null;
+    const strongScoreThreshold = isPanCard ? 170 : 120;
+    let lastError = null;
+
+    for (const profile of requestProfiles) {
+      for (const endpoint of endpoints) {
+        const result = await tryOcrEndpoint(endpoint, profile);
+        if (!result.ok) {
+          lastError = result.error || lastError;
+          continue;
+        }
+
+        const data = result.payload;
+        if (data?.IsErroredOnProcessing) {
+          lastError = data?.ErrorMessage || lastError;
+          continue;
+        }
+
+        const parsedText = (data?.ParsedResults || [])
+          .map((entry) => entry?.ParsedText || '')
+          .join(' ')
+          .trim();
+
+        if (parsedText) {
+          const score = scoreOcrText(parsedText, documentType);
+          candidates.push({ text: parsedText, score });
+
+          if (!bestCandidate || score > bestCandidate.score) {
+            bestCandidate = { text: parsedText, score };
+          }
+
+          // Stop early once we have a high-confidence OCR candidate.
+          if (bestCandidate.score >= strongScoreThreshold) {
+            return res.json({ text: bestCandidate.text });
+          }
+        }
+      }
     }
 
-    const data = finalResult.payload;
-    if (data?.IsErroredOnProcessing) {
-      return res.status(422).json({ error: data?.ErrorMessage || 'OCR processing error' });
+    if (!candidates.length) {
+      return res.status(502).json({ error: lastError || 'OCR API request failed' });
     }
 
-    const parsedText = (data?.ParsedResults || [])
-      .map((result) => result?.ParsedText || '')
-      .join(' ')
-      .trim();
+    const parsedText = candidates
+      .sort((left, right) => right.score - left.score)[0]?.text || '';
 
     if (!parsedText) {
       return res.status(422).json({ error: 'OCR returned empty text' });
@@ -164,9 +241,47 @@ const isTokenMatch = (expectedToken = '', candidateToken = '') => {
     return true;
   }
 
+  // OCR may merge full names or initials into one token (e.g. "manikandanm").
+  if (
+    (candidateToken.includes(expectedToken) && expectedToken.length >= 3)
+    || (expectedToken.includes(candidateToken) && candidateToken.length >= 3)
+  ) {
+    return true;
+  }
+
   const distance = levenshteinDistance(expectedToken, candidateToken);
   const allowance = expectedToken.length >= 7 ? 2 : 1;
   return distance <= allowance;
+};
+
+const findBestCompactSimilarity = (expectedCompact = '', extractedCompact = '') => {
+  if (!expectedCompact || !extractedCompact) {
+    return 0;
+  }
+
+  if (extractedCompact.includes(expectedCompact)) {
+    return 1;
+  }
+
+  const expectedLength = expectedCompact.length;
+  const extractedLength = extractedCompact.length;
+
+  if (extractedLength <= expectedLength) {
+    const distance = levenshteinDistance(expectedCompact, extractedCompact);
+    return 1 - distance / Math.max(expectedLength, extractedLength, 1);
+  }
+
+  let bestSimilarity = 0;
+  for (let index = 0; index <= extractedLength - expectedLength; index += 1) {
+    const window = extractedCompact.slice(index, index + expectedLength);
+    const distance = levenshteinDistance(expectedCompact, window);
+    const similarity = 1 - distance / Math.max(expectedLength, window.length, 1);
+    if (similarity > bestSimilarity) {
+      bestSimilarity = similarity;
+    }
+  }
+
+  return bestSimilarity;
 };
 
 const findBestWindowSimilarity = (expectedTokens = [], extractedTokens = []) => {
@@ -199,6 +314,7 @@ const findBestWindowSimilarity = (expectedTokens = [], extractedTokens = []) => 
 
 const verifyNameMatch = (applicantName = '', extractedText = '') => {
   const expectedTokens = tokenizeName(applicantName);
+  const expectedCompact = normalizeText(applicantName);
   if (!expectedTokens.length) {
     return {
       isMatch: false,
@@ -208,6 +324,7 @@ const verifyNameMatch = (applicantName = '', extractedText = '') => {
   }
 
   const extractedTokens = tokenizeName(extractedText);
+  const extractedCompact = normalizeText(extractedText);
   if (!extractedTokens.length) {
     return {
       isMatch: false,
@@ -222,9 +339,15 @@ const verifyNameMatch = (applicantName = '', extractedText = '') => {
 
   const tokenCoverage = matchedTokenCount / expectedTokens.length;
   const fullNameSimilarity = findBestWindowSimilarity(expectedTokens, extractedTokens);
+  const compactSimilarity = findBestCompactSimilarity(expectedCompact, extractedCompact);
 
-  const isMatch = tokenCoverage === 1 || (tokenCoverage >= 0.67 && fullNameSimilarity >= 0.82);
-  const confidence = Number((tokenCoverage * 0.6 + fullNameSimilarity * 0.4).toFixed(2));
+  const isMatch =
+    tokenCoverage === 1
+    || compactSimilarity >= 0.96
+    || (tokenCoverage >= 0.67 && fullNameSimilarity >= 0.82)
+    || (tokenCoverage >= 0.5 && compactSimilarity >= 0.9);
+
+  const confidence = Number((tokenCoverage * 0.45 + fullNameSimilarity * 0.25 + compactSimilarity * 0.3).toFixed(2));
 
   return {
     isMatch,
@@ -320,7 +443,8 @@ app.post('/validate-document', (req, res) => {
     }
 
     const cleanedText = extractedText.trim();
-    const normalizedText = normalizeText(cleanedText);
+    const normalizedDocumentType = normalizeText(documentType);
+    const isSalarySlip = normalizedDocumentType.includes('salaryslip');
     const applicantName = String(userDetails?.name || '');
     const monthlyIncome = toPositiveNumber(userDetails?.monthlyIncome || userDetails?.income);
     const annualIncome = toPositiveNumber(userDetails?.annualIncome) || (monthlyIncome ? monthlyIncome * 12 : 0);
@@ -344,23 +468,20 @@ app.post('/validate-document', (req, res) => {
     }
 
     let incomeCheck = 'not_applicable';
-    if (normalizeText(documentType).includes('salaryslip') && (annualIncome || monthlyIncome)) {
-      const expectedIncomeValues = [];
-      if (annualIncome) {
-        expectedIncomeValues.push(annualIncome);
-      }
-      if (monthlyIncome) {
-        expectedIncomeValues.push(monthlyIncome);
-      }
+    if (isSalarySlip) {
+      if (!annualIncome) {
+        incomeCheck = 'inconclusive';
+        issues.push('Annual income is missing in provided application details.');
+      } else {
+        const incomeEvaluation = evaluateSalaryIncomeMatch({
+          text: cleanedText,
+          expectedValues: [annualIncome],
+        });
 
-      const incomeEvaluation = evaluateSalaryIncomeMatch({
-        text: cleanedText,
-        expectedValues: expectedIncomeValues,
-      });
-
-      incomeCheck = incomeEvaluation.outcome;
-      if (incomeEvaluation.outcome === 'mismatch') {
-        issues.push('Income mismatch in salary slip validation.');
+        incomeCheck = incomeEvaluation.outcome;
+        if (incomeEvaluation.outcome !== 'matched') {
+          issues.push('Annual income extracted from salary slip does not match provided details.');
+        }
       }
     }
 
