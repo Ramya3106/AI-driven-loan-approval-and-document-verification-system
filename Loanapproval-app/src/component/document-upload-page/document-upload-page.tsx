@@ -433,7 +433,24 @@ export default function DocumentUploadPage({ navigation, route }: any) {
       return;
     }
 
-    Alert.alert('AI Approval Prediction', 'Proceeding to AI approval prediction step.');
+    const documentVerificationScore = Math.round((verifiedCount / DOCUMENT_TYPES.length) * 100);
+    const formData = route?.params?.formData || {};
+    const existingLoanData = route?.params?.existingLoanData || {};
+
+    navigation.navigate('ResultPage', {
+      annualIncome: formData.annualIncome || formData.monthlyIncome,
+      cibilScore: formData.cibilScore,
+      jobType: formData.jobType,
+      loanType: formData.loanType,
+      requestedLoanAmount: formData.loanAmount,
+      documentVerificationScore,
+      emiHistory: {
+        hasExistingLoan: route?.params?.hasExistingLoan,
+        monthlyEMI: existingLoanData.monthlyEMI,
+        pendingEMI: existingLoanData.pendingEMI,
+        remainingTenure: existingLoanData.remainingTenure,
+      },
+    });
   };
 
   return (
