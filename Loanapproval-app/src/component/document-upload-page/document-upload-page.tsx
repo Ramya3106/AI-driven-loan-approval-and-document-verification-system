@@ -12,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import Constants from 'expo-constants';
 
 const DOCUMENT_TYPES = [
@@ -23,7 +24,7 @@ const DOCUMENT_TYPES = [
   { key: 'addressProof', label: 'Address Proof' },
 ];
 
-const OCR_TIMEOUT_MS = 45000;
+const OCR_TIMEOUT_MS = 90000;
 const VALIDATION_TIMEOUT_MS = 10000;
 const LOCAL_OCR_TIMEOUT_MS = 15000;
 const IS_EXPO_GO =
@@ -108,7 +109,7 @@ const requestGalleryPermission = async () => {
 
 const normalizeText = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-const runOcrViaApi = async (base64Image: string) => {
+const runOcrViaApi = async ({ base64Image, documentType }: { base64Image: string; documentType: string }) => {
   const response = await withTimeout(
     `${getApiBaseUrl()}/ocr`,
     {
@@ -116,10 +117,10 @@ const runOcrViaApi = async (base64Image: string) => {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ base64Image }),
+      body: JSON.stringify({ base64Image, documentType }),
     },
     OCR_TIMEOUT_MS,
-    'OCR timed out after 45 seconds. Please retry with a clearer image.'
+    `OCR timed out after ${Math.round(OCR_TIMEOUT_MS / 1000)} seconds. Please retry with a clearer image.`
   );
 
   if (!response.ok) {
@@ -153,7 +154,15 @@ const runLocalOcr = async (imageUri: string) => {
   return result?.text || '';
 };
 
-const runBestEffortOcr = async ({ imageUri, base64Image }: { imageUri: string; base64Image: string }) => {
+const runBestEffortOcr = async ({
+  imageUri,
+  base64Image,
+  documentType,
+}: {
+  imageUri: string;
+  base64Image: string;
+  documentType: string;
+}) => {
   try {
     const localText = await runLocalOcr(imageUri);
     if (localText && localText.trim().length >= 20) {
@@ -167,7 +176,80 @@ const runBestEffortOcr = async ({ imageUri, base64Image }: { imageUri: string; b
     throw new Error('Unable to extract text from image. Please retry with a clearer image.');
   }
 
-  return runOcrViaApi(base64Image);
+  const variants: Array<{ base64: string; label: string }> = [
+    { base64: base64Image, label: 'original' },
+  ];
+
+  try {
+    const compact = await manipulateAsync(
+      imageUri,
+      [{ resize: { width: 1400 } }],
+      { compress: 0.7, format: SaveFormat.JPEG, base64: true }
+    );
+
+    if (compact?.base64) {
+      variants.push({ base64: compact.base64, label: 'resized' });
+    }
+
+    const rotatedLeft = await manipulateAsync(
+      imageUri,
+      [{ resize: { width: 1400 } }, { rotate: -90 }],
+      { compress: 0.72, format: SaveFormat.JPEG, base64: true }
+    );
+    if (rotatedLeft?.base64) {
+      variants.push({ base64: rotatedLeft.base64, label: 'rotated-left' });
+    }
+
+    const rotatedRight = await manipulateAsync(
+      imageUri,
+      [{ resize: { width: 1400 } }, { rotate: 90 }],
+      { compress: 0.72, format: SaveFormat.JPEG, base64: true }
+    );
+    if (rotatedRight?.base64) {
+      variants.push({ base64: rotatedRight.base64, label: 'rotated-right' });
+    }
+  } catch (error) {
+    // If image manipulation is unavailable/fails, continue with original variant.
+  }
+
+  const isPan = normalizeText(documentType).includes('pancard');
+  let bestText = '';
+  let lastError: any = null;
+
+  for (const variant of variants) {
+    try {
+      const text = (await runOcrViaApi({ base64Image: variant.base64, documentType }))?.trim() || '';
+      if (!text) {
+        continue;
+      }
+
+      const compactText = normalizeText(text);
+      const score = compactText.length
+        + ((isPan && /[A-Z]{5}[0-9]{4}[A-Z]/i.test(text)) ? 150 : 0)
+        + ((isPan && /income\s*tax|permanent\s*account\s*number/i.test(text)) ? 60 : 0);
+
+      const bestScore = bestText
+        ? (normalizeText(bestText).length + ((isPan && /[A-Z]{5}[0-9]{4}[A-Z]/i.test(bestText)) ? 150 : 0))
+        : 0;
+
+      if (score > bestScore) {
+        bestText = text;
+      }
+
+      // Stop early if we extracted a strong PAN/readable candidate.
+      if ((isPan && /[A-Z]{5}[0-9]{4}[A-Z]/i.test(text)) || compactText.length >= 60) {
+        return text;
+      }
+    } catch (error: any) {
+      lastError = error;
+    }
+  }
+
+  if (bestText) {
+    return bestText;
+  }
+
+  throw lastError || new Error('Unable to extract readable text from document image.');
 };
 
 const runAiValidation = async ({ documentType, extractedText, userDetails }: any) => {
@@ -261,7 +343,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
     const imageResult = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.5,
+      quality: 0.8,
       base64: true,
       selectionLimit: 1,
     });
@@ -294,6 +376,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
       const extractedText = await runBestEffortOcr({
         imageUri: selected.uri,
         base64Image: selectedBase64,
+        documentType: label,
       });
       const aiResult = await runAiValidation({
         documentType: label,
@@ -302,11 +385,19 @@ export default function DocumentUploadPage({ navigation, route }: any) {
       });
 
       const statusText = normalizeText(aiResult?.status);
+      const isSalarySlip = key === 'salarySlip';
       const isNameMatched = aiResult?.checks?.name !== false;
-      const isOriginal = statusText === 'original' && isNameMatched;
+      const isIncomeMatched = aiResult?.checks?.income === 'matched';
+      const isOriginal = statusText === 'original' && isNameMatched && (!isSalarySlip || isIncomeMatched);
+      const backendMessage = String(aiResult?.message || '').trim();
+      const isReadabilityFailure = /unable to read|insufficient|very little readable/i.test(backendMessage);
 
       const failureMessage = !isNameMatched
-        ? 'Name mismatch with provided application details.'
+        ? (isReadabilityFailure
+          ? (backendMessage || 'Unable to read name from document. Please upload a clearer image.')
+          : 'Name mismatch with provided application details.')
+        : (isSalarySlip && !isIncomeMatched)
+          ? (backendMessage || 'Annual income mismatch with provided application details.')
         : aiResult?.message || 'Tampered Document';
 
       updateDocument(key, {
