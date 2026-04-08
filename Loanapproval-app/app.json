@@ -18,7 +18,7 @@
       "package": "com.anonymous.Loanapprovalapp"
     },
     "extra": {
-      "apiBaseUrl": "http://10.236.199.242:5000"
+      "apiBaseUrl": "http://10.207.151.242:5000"
     }
   }
 }
