@@ -2,6 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -19,6 +21,194 @@ mongoose
   .catch((error) => {
     console.error('MongoDB connection error:', error.message);
   });
+
+const userSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+const otpStore = new Map();
+const OTP_EXPIRY_MS = 10 * 60 * 1000;
+
+const sendOtpViaEmailJs = async ({ toName, toEmail, otp }) => {
+  const serviceId = String(process.env.EMAILJS_SERVICE_ID || '').trim();
+  const templateId = String(process.env.EMAILJS_TEMPLATE_ID || '').trim();
+  const publicKey = String(process.env.EMAILJS_PUBLIC_KEY || '').trim();
+  const privateKey = String(process.env.EMAILJS_PRIVATE_KEY || '').trim();
+
+  if (!serviceId || !templateId || !publicKey || !privateKey) {
+    throw new Error('EMAILJS_NOT_CONFIGURED');
+  }
+
+  const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      service_id: serviceId,
+      template_id: templateId,
+      user_id: publicKey,
+      accessToken: privateKey,
+      template_params: {
+        to_name: toName,
+        to_email: toEmail,
+        otp,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`EMAILJS_SEND_FAILED:${response.status}:${errorText}`);
+  }
+};
+
+app.post('/auth/send-otp', async (req, res) => {
+  try {
+    const { name, email } = req.body || {};
+    const normalizedName = String(name || '').trim();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+
+    if (!normalizedName || !normalizedEmail) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid email address' });
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    otpStore.set(normalizedEmail, {
+      otp,
+      name: normalizedName,
+      expiresAt: Date.now() + OTP_EXPIRY_MS,
+    });
+
+    await sendOtpViaEmailJs({
+      toName: normalizedName,
+      toEmail: normalizedEmail,
+      otp,
+    });
+
+    return res.status(200).json({
+      message: 'OTP sent successfully to your email.',
+      deliveryMode: 'emailjs',
+    });
+  } catch (error) {
+    console.error('Send OTP error:', error.message);
+    if (String(error.message || '').includes('EMAILJS_NOT_CONFIGURED')) {
+      return res.status(500).json({
+        error:
+          'EmailJS is not configured. Set EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, and EMAILJS_PRIVATE_KEY in server/.env.',
+      });
+    }
+
+    if (String(error.message || '').includes('EMAILJS_SEND_FAILED')) {
+      return res.status(500).json({
+        error: 'Failed to send OTP email via EmailJS. Verify EmailJS service/template/key configuration.',
+      });
+    }
+
+    return res.status(500).json({ error: 'Failed to send OTP email' });
+  }
+});
+
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { name, email, otp, password } = req.body || {};
+    const normalizedName = String(name || '').trim();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const normalizedOtp = String(otp || '').trim();
+    const normalizedPassword = String(password || '');
+
+    if (!normalizedName || !normalizedEmail || !normalizedOtp || !normalizedPassword) {
+      return res.status(400).json({ error: 'Name, email, OTP and password are required' });
+    }
+
+    if (normalizedPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const otpEntry = otpStore.get(normalizedEmail);
+    if (!otpEntry) {
+      return res.status(400).json({ error: 'Please request OTP first' });
+    }
+
+    if (Date.now() > otpEntry.expiresAt) {
+      otpStore.delete(normalizedEmail);
+      return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+    }
+
+    if (otpEntry.otp !== normalizedOtp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+    const existingUser = await User.findOne({ email: normalizedEmail }).lean();
+    if (existingUser) {
+      otpStore.delete(normalizedEmail);
+      return res.status(409).json({ error: 'Email is already registered. Please login.' });
+    }
+
+    const passwordHash = await bcrypt.hash(normalizedPassword, 10);
+
+    await User.create({
+      name: normalizedName,
+      email: normalizedEmail,
+      passwordHash,
+    });
+
+    otpStore.delete(normalizedEmail);
+
+    return res.status(201).json({
+      message: 'Registration successful. Please login.',
+    });
+  } catch (error) {
+    console.error('Register error:', error.message);
+    return res.status(500).json({ error: 'Failed to register user' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const normalizedPassword = String(password || '');
+
+    if (!normalizedEmail || !normalizedPassword) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const passwordMatches = await bcrypt.compare(normalizedPassword, user.passwordHash);
+    if (!passwordMatches) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    return res.status(200).json({
+      message: 'Login successful',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error('Login error:', error.message);
+    return res.status(500).json({ error: 'Failed to login' });
+  }
+});
 
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
