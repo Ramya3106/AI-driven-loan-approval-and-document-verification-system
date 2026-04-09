@@ -59,6 +59,9 @@ const sendOtpViaEmailJs = async ({ toName, toEmail, otp }) => {
       template_params: {
         to_name: toName,
         to_email: toEmail,
+        email: toEmail,
+        toEmail,
+        user_email: toEmail,
         otp,
       },
     }),
