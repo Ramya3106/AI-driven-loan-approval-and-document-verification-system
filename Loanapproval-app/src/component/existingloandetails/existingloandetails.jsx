@@ -66,6 +66,17 @@ const withTimeout = async (url, options, timeoutMs, fallbackMessage) => {
   }
 };
 
+const requestJson = async (url, options, timeoutMs = 12000) => {
+  const response = await withTimeout(
+    url,
+    options,
+    timeoutMs,
+    'Request timed out. Check if backend server is reachable.'
+  );
+  const payload = await response.json().catch(() => ({}));
+  return { response, payload };
+};
+
 const withPromiseTimeout = async (workPromise, timeoutMs, fallbackMessage) => {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
@@ -167,6 +178,7 @@ export default function ExistingLoanDetails({ navigation, route }) {
   const [uploadedDocumentBase64, setUploadedDocumentBase64] = useState('');
   const [verificationStatus, setVerificationStatus] = useState('idle');
   const [verificationMessage, setVerificationMessage] = useState('');
+  const [saving, setSaving] = useState(false);
 
   const applicantName = useMemo(() => {
     const formData = route?.params?.formData || {};
@@ -261,44 +273,73 @@ export default function ExistingLoanDetails({ navigation, route }) {
       return;
     }
 
-    if (hasExistingLoan === false) {
+    const user = route?.params?.user || null;
+    const loanDetailId = route?.params?.loanDetailId || null;
+
+    if (hasExistingLoan) {
+      if (
+        !loanData.loanType ||
+        !loanData.totalLoanAmount ||
+        !loanData.monthlyEMI ||
+        !loanData.remainingTenure ||
+        !loanData.pendingEMI
+      ) {
+        Alert.alert('Missing fields', 'Please fill all existing-loan fields.');
+        return;
+      }
+
+      const verified = await verifyExistingLoanDocument();
+      if (!verified) {
+        Alert.alert('Verification failed', 'Document verification did not pass.');
+        return;
+      }
+
+      if (loanData.pendingEMI === 'yes') {
+        Alert.alert(
+          'Blacklisted',
+          'You are marked under blacklist due to pending EMI payments and cannot proceed.'
+        );
+        return;
+      }
+    }
+
+    setSaving(true);
+    try {
+      const payloadToSave = {
+        userId: user?.id || null,
+        userEmail: user?.email || '',
+        loanDetailId,
+        hasExistingLoan,
+        loanType: hasExistingLoan ? loanData.loanType : '',
+        totalLoanAmount: hasExistingLoan ? loanData.totalLoanAmount : 0,
+        monthlyEMI: hasExistingLoan ? loanData.monthlyEMI : 0,
+        remainingTenure: hasExistingLoan ? loanData.remainingTenure : 0,
+        pendingEMI: hasExistingLoan ? loanData.pendingEMI : 'no',
+        verificationStatus: hasExistingLoan ? verificationStatus : 'not_required',
+        verificationMessage: hasExistingLoan ? verificationMessage : '',
+      };
+
+      const { response, payload } = await requestJson(`${getApiBaseUrl()}/api/existing-loans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadToSave),
+      });
+
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Unable to save existing loan details');
+      }
+
       navigation.navigate('DocumentUploadPage', {
         ...route?.params,
-        hasExistingLoan: false,
+        hasExistingLoan,
+        existingLoanData: hasExistingLoan ? loanData : {},
+        existingLoanId: payload?.id || null,
       });
-      return;
+    } catch (error) {
+      Alert.alert('Save failed', error?.message || 'Unable to save existing loan details');
+    } finally {
+      setSaving(false);
     }
-
-    if (
-      !loanData.loanType ||
-      !loanData.totalLoanAmount ||
-      !loanData.monthlyEMI ||
-      !loanData.remainingTenure ||
-      !loanData.pendingEMI
-    ) {
-      Alert.alert('Missing fields', 'Please fill all existing-loan fields.');
-      return;
-    }
-
-    const verified = await verifyExistingLoanDocument();
-    if (!verified) {
-      Alert.alert('Verification failed', 'Document verification did not pass.');
-      return;
-    }
-
-    if (loanData.pendingEMI === 'yes') {
-      Alert.alert(
-        'Blacklisted',
-        'You are marked under blacklist due to pending EMI payments and cannot proceed.'
-      );
-      return;
-    }
-
-    navigation.navigate('DocumentUploadPage', {
-      ...route?.params,
-      hasExistingLoan: true,
-      existingLoanData: loanData,
-    });
   };
 
   return (
@@ -397,11 +438,15 @@ export default function ExistingLoanDetails({ navigation, route }) {
             ) : null}
 
             <TouchableOpacity
-              style={[styles.nextButton, hasExistingLoan === null && styles.nextButtonDisabled]}
+              style={[
+                styles.nextButton,
+                hasExistingLoan === null && styles.nextButtonDisabled,
+                saving && styles.nextButtonDisabled,
+              ]}
               onPress={handleNext}
-              disabled={hasExistingLoan === null}
+              disabled={hasExistingLoan === null || saving}
             >
-              <Text style={styles.nextButtonText}>Next -&gt;</Text>
+              <Text style={styles.nextButtonText}>{saving ? 'Saving...' : 'Next -&gt;'}</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
