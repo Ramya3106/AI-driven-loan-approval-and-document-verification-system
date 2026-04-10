@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
+  Alert,
   StyleSheet,
   Text,
   TextInput,
@@ -12,8 +14,63 @@ import {
   Modal,
   FlatList,
 } from 'react-native';
+import Constants from 'expo-constants';
 
-export default function Application({ navigation }) {
+const sanitizeBaseUrl = (value) => (value || '').trim().replace(/\/+$/, '');
+
+const getApiBaseUrl = () => {
+  const manualBaseUrl = sanitizeBaseUrl(
+    String(
+      process.env.EXPO_PUBLIC_API_BASE_URL ||
+      Constants.expoConfig?.extra?.apiBaseUrl ||
+      Constants.manifest?.extra?.apiBaseUrl ||
+      ''
+    )
+  );
+
+  if (manualBaseUrl) {
+    return manualBaseUrl;
+  }
+
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.expoConfig?.extra?.expoClient?.hostUri ||
+    Constants.manifest2?.extra?.expoClient?.hostUri ||
+    Constants.manifest?.debuggerHost ||
+    Constants.manifest?.hostUri ||
+    '';
+
+  const host = hostUri
+    ? hostUri.split(':')[0]
+    : Platform.OS === 'android'
+      ? '10.0.2.2'
+      : 'localhost';
+
+  return sanitizeBaseUrl(`http://${host}:5000`);
+};
+
+const requestJson = async (url, options, timeoutMs = 12000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    return { response, payload };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Request timed out. Check whether the backend is running.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+export default function Application({ navigation, route }) {
   const [formData, setFormData] = useState({
     fullName: '',
     jobType: '',
@@ -27,6 +84,9 @@ export default function Application({ navigation }) {
   const [autoCalculate, setAutoCalculate] = useState(true);
   const [jobTypeModal, setJobTypeModal] = useState(false);
   const [loanTypeModal, setLoanTypeModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
+  const loggedInUser = route?.params?.user || null;
 
   const jobTypes = [
     { label: 'Government', value: 'govt' },
@@ -71,16 +131,46 @@ export default function Application({ navigation }) {
     setAutoCalculate(false);
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     // Validate form
     if (!formData.fullName || !formData.jobType || !formData.annualIncome || 
         !formData.cibilScore || !formData.loanType || !formData.loanAmount) {
-      alert('Please fill all required fields');
+      Alert.alert('Missing fields', 'Please fill all required fields.');
       return;
     }
-    
-    // Navigate to Existing Loan Details page
-    navigation.navigate('ExistingLoanDetails', { formData });
+
+    setSaving(true);
+    try {
+      const { response, payload } = await requestJson(`${apiBaseUrl}/api/loan-details`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: loggedInUser?.id || null,
+          userEmail: loggedInUser?.email || '',
+          fullName: formData.fullName,
+          jobType: formData.jobType,
+          annualIncome: formData.annualIncome,
+          monthlyIncome: formData.monthlyIncome,
+          cibilScore: formData.cibilScore,
+          loanType: formData.loanType,
+          loanAmount: formData.loanAmount,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Unable to save loan details');
+      }
+
+      navigation.navigate('ExistingLoanDetails', {
+        formData,
+        user: loggedInUser,
+        loanDetailId: payload?.id || null,
+      });
+    } catch (error) {
+      Alert.alert('Save failed', error?.message || 'Unable to save loan details');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -202,8 +292,12 @@ export default function Application({ navigation }) {
             </View>
 
             {/* Submit Button */}
-            <TouchableOpacity style={styles.submitButton} onPress={handleSubmit}>
-              <Text style={styles.submitButtonText}>Next →</Text>
+            <TouchableOpacity
+              style={[styles.submitButton, saving && styles.submitButtonDisabled]}
+              onPress={handleSubmit}
+              disabled={saving}
+            >
+              {saving ? <ActivityIndicator color="#ffffff" size="small" /> : <Text style={styles.submitButtonText}>Next →</Text>}
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -437,6 +531,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 8,
     elevation: 6,
+  },
+  submitButtonDisabled: {
+    opacity: 0.75,
   },
   submitButtonText: {
     color: '#ffffff',
