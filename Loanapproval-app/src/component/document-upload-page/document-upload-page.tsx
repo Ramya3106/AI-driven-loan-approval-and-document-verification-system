@@ -282,6 +282,17 @@ const runAiValidation = async ({ documentType, extractedText, userDetails }: any
   return response.json();
 };
 
+const requestJson = async (url: string, options: any, timeoutMs = 20000) => {
+  const response = await withTimeout(
+    url,
+    options,
+    timeoutMs,
+    'Request timed out while saving document. Please retry.'
+  );
+  const payload = await response.json().catch(() => ({}));
+  return { response, payload };
+};
+
 export default function DocumentUploadPage({ navigation, route }: any) {
   const [documents, setDocuments] = useState(() => {
     const initialState: any = {};
@@ -293,6 +304,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         statusText: '',
         progress: 0,
         extractedText: '',
+        storedId: '',
       };
     });
     return initialState;
@@ -319,6 +331,48 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         ...patch,
       },
     }));
+  };
+
+  const persistDocument = async ({
+    key,
+    label,
+    base64,
+    status,
+    statusText,
+    extractedText,
+  }: {
+    key: string;
+    label: string;
+    base64: string;
+    status: string;
+    statusText: string;
+    extractedText: string;
+  }) => {
+    const user = route?.params?.user || null;
+    const loanDetailId = route?.params?.loanDetailId || null;
+    const existingLoanId = route?.params?.existingLoanId || null;
+
+    const { response, payload } = await requestJson(`${getApiBaseUrl()}/api/documents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: user?.id || null,
+        userEmail: user?.email || '',
+        loanDetailId,
+        existingLoanId,
+        documentType: label,
+        fileBase64: base64,
+        status,
+        statusText,
+        extractedText,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(payload?.error || 'Unable to store document in database');
+    }
+
+    updateDocument(key, { storedId: payload?.id || '' });
   };
 
   const simulateProgress = (key: string) => {
@@ -406,12 +460,37 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         statusText: isOriginal ? 'Original' : failureMessage,
         progress: 100,
       });
+
+      await persistDocument({
+        key,
+        label,
+        base64: selectedBase64,
+        status: isOriginal ? 'verified' : 'tampered',
+        statusText: isOriginal ? 'Original' : failureMessage,
+        extractedText,
+      });
     } catch (error: any) {
+      const errorMessage = error?.message || 'Tampered Document';
       updateDocument(key, {
         status: 'tampered',
-        statusText: error?.message || 'Tampered Document',
+        statusText: errorMessage,
         progress: 100,
       });
+
+      if (selectedBase64) {
+        try {
+          await persistDocument({
+            key,
+            label,
+            base64: selectedBase64,
+            status: 'tampered',
+            statusText: errorMessage,
+            extractedText: '',
+          });
+        } catch (saveError: any) {
+          Alert.alert('Save failed', saveError?.message || 'Unable to store document in database.');
+        }
+      }
     }
   };
 
@@ -436,14 +515,19 @@ export default function DocumentUploadPage({ navigation, route }: any) {
     const documentVerificationScore = Math.round((verifiedCount / DOCUMENT_TYPES.length) * 100);
     const formData = route?.params?.formData || {};
     const existingLoanData = route?.params?.existingLoanData || {};
+    const storedDocumentIds = DOCUMENT_TYPES
+      .map((doc) => documents[doc.key]?.storedId)
+      .filter(Boolean);
 
     navigation.navigate('ResultPage', {
+      ...route?.params,
       annualIncome: formData.annualIncome || formData.monthlyIncome,
       cibilScore: formData.cibilScore,
       jobType: formData.jobType,
       loanType: formData.loanType,
       requestedLoanAmount: formData.loanAmount,
       documentVerificationScore,
+      documentIds: storedDocumentIds,
       emiHistory: {
         hasExistingLoan: route?.params?.hasExistingLoan,
         monthlyEMI: existingLoanData.monthlyEMI,
