@@ -1,5 +1,7 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import {
+  Alert,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -7,6 +9,61 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import Constants from 'expo-constants';
+
+const sanitizeBaseUrl = (value) => (value || '').trim().replace(/\/+$/, '');
+
+const getApiBaseUrl = () => {
+  const manualBaseUrl = sanitizeBaseUrl(
+    String(
+      process.env.EXPO_PUBLIC_API_BASE_URL ||
+      Constants.expoConfig?.extra?.apiBaseUrl ||
+      Constants.manifest?.extra?.apiBaseUrl ||
+      ''
+    )
+  );
+
+  if (manualBaseUrl) {
+    return manualBaseUrl;
+  }
+
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.expoConfig?.extra?.expoClient?.hostUri ||
+    Constants.manifest2?.extra?.expoClient?.hostUri ||
+    Constants.manifest?.debuggerHost ||
+    Constants.manifest?.hostUri ||
+    '';
+
+  const host = hostUri
+    ? hostUri.split(':')[0]
+    : Platform.OS === 'android'
+      ? '10.0.2.2'
+      : 'localhost';
+
+  return sanitizeBaseUrl(`http://${host}:5000`);
+};
+
+const requestJson = async (url, options, timeoutMs = 12000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    return { response, payload };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Request timed out while saving approval result.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 const toPositiveNumber = (value) => {
   const parsed = Number(String(value || '').replace(/[^0-9.]/g, ''));
@@ -118,6 +175,10 @@ const predictEligibility = ({
 
 export default function ResultPage({ route, navigation }) {
   const {
+    user,
+    loanDetailId,
+    existingLoanId,
+    documentIds,
     annualIncome,
     cibilScore,
     jobType,
@@ -126,6 +187,7 @@ export default function ResultPage({ route, navigation }) {
     emiHistory,
     requestedLoanAmount,
   } = route?.params || {};
+  const didSaveRef = useRef(false);
 
   const result = useMemo(() => {
     return predictEligibility({
@@ -145,6 +207,63 @@ export default function ResultPage({ route, navigation }) {
     documentVerificationScore,
     emiHistory,
     requestedLoanAmount,
+  ]);
+
+  useEffect(() => {
+    if (didSaveRef.current) {
+      return;
+    }
+
+    didSaveRef.current = true;
+
+    const saveApproval = async () => {
+      try {
+        const { response, payload } = await requestJson(`${getApiBaseUrl()}/api/loan-approvals`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: user?.id || null,
+            userEmail: user?.email || '',
+            loanDetailId: loanDetailId || null,
+            existingLoanId: existingLoanId || null,
+            documentIds: Array.isArray(documentIds) ? documentIds : [],
+            annualIncome,
+            cibilScore,
+            jobType,
+            loanType,
+            requestedLoanAmount,
+            suggestedLoanAmount: result.suggestedLoanAmount,
+            approvalPercentage: result.approvalPercentage,
+            decisionLabel: result.decisionLabel,
+            documentVerificationScore,
+            emiHistory,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(payload?.error || 'Unable to save loan approval result');
+        }
+      } catch (error) {
+        Alert.alert('Save failed', error?.message || 'Unable to store result in database');
+      }
+    };
+
+    saveApproval();
+  }, [
+    annualIncome,
+    cibilScore,
+    documentIds,
+    documentVerificationScore,
+    emiHistory,
+    existingLoanId,
+    jobType,
+    loanDetailId,
+    loanType,
+    requestedLoanAmount,
+    result.approvalPercentage,
+    result.decisionLabel,
+    result.suggestedLoanAmount,
+    user,
   ]);
 
   return (
