@@ -27,14 +27,347 @@ const userSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
+    lastLoginAt: { type: Date, default: null },
+    loginCount: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
+const loanDetailSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    userEmail: { type: String, default: '' },
+    fullName: { type: String, required: true, trim: true },
+    jobType: { type: String, required: true, trim: true },
+    annualIncome: { type: Number, required: true },
+    monthlyIncome: { type: Number, required: true },
+    cibilScore: { type: Number, required: true },
+    loanType: { type: String, required: true, trim: true },
+    loanAmount: { type: Number, required: true },
+  },
+  { timestamps: true, collection: 'loandetails' }
+);
+
+const existingLoanSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    userEmail: { type: String, default: '' },
+    loanDetailId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoanDetail', default: null },
+    hasExistingLoan: { type: Boolean, required: true },
+    loanType: { type: String, default: '' },
+    totalLoanAmount: { type: Number, default: 0 },
+    monthlyEMI: { type: Number, default: 0 },
+    remainingTenure: { type: Number, default: 0 },
+    pendingEMI: { type: String, default: '' },
+    verificationStatus: { type: String, default: 'not_required' },
+    verificationMessage: { type: String, default: '' },
+  },
+  { timestamps: true, collection: 'existingloans' }
+);
+
+const documentSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    userEmail: { type: String, default: '' },
+    loanDetailId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoanDetail', default: null },
+    existingLoanId: { type: mongoose.Schema.Types.ObjectId, ref: 'ExistingLoan', default: null },
+    documentType: { type: String, required: true, trim: true },
+    fileBase64: { type: String, required: true },
+    status: { type: String, default: 'uploaded' },
+    statusText: { type: String, default: '' },
+    extractedText: { type: String, default: '' },
+  },
+  { timestamps: true, collection: 'documents' }
+);
+
+const loanApprovalSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    userEmail: { type: String, default: '' },
+    loanDetailId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoanDetail', default: null },
+    existingLoanId: { type: mongoose.Schema.Types.ObjectId, ref: 'ExistingLoan', default: null },
+    documentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Document' }],
+    annualIncome: { type: Number, default: 0 },
+    cibilScore: { type: Number, default: 0 },
+    jobType: { type: String, default: '' },
+    loanType: { type: String, default: '' },
+    requestedLoanAmount: { type: Number, default: 0 },
+    suggestedLoanAmount: { type: Number, default: 0 },
+    approvalPercentage: { type: Number, default: 0 },
+    decisionLabel: { type: String, default: '' },
+    documentVerificationScore: { type: Number, default: 0 },
+    emiHistory: {
+      hasExistingLoan: { type: Boolean, default: false },
+      monthlyEMI: { type: Number, default: 0 },
+      pendingEMI: { type: String, default: '' },
+      remainingTenure: { type: Number, default: 0 },
+    },
+  },
+  { timestamps: true, collection: 'loanapprovals' }
+);
+
+const LoanDetail = mongoose.models.LoanDetail || mongoose.model('LoanDetail', loanDetailSchema);
+const ExistingLoan = mongoose.models.ExistingLoan || mongoose.model('ExistingLoan', existingLoanSchema);
+const Document = mongoose.models.Document || mongoose.model('Document', documentSchema);
+const LoanApproval = mongoose.models.LoanApproval || mongoose.model('LoanApproval', loanApprovalSchema);
+
+const toNumber = (value) => {
+  const parsed = Number(String(value ?? '').replace(/[^0-9.]/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+app.post('/api/loan-details', async (req, res) => {
+  try {
+    const {
+      userId,
+      userEmail,
+      fullName,
+      jobType,
+      annualIncome,
+      monthlyIncome,
+      cibilScore,
+      loanType,
+      loanAmount,
+    } = req.body || {};
+
+    const normalizedName = String(fullName || '').trim();
+    const normalizedJobType = String(jobType || '').trim();
+    const normalizedLoanType = String(loanType || '').trim();
+
+    if (
+      !normalizedName
+      || !normalizedJobType
+      || !normalizedLoanType
+      || !annualIncome
+      || !monthlyIncome
+      || !cibilScore
+      || !loanAmount
+    ) {
+      return res.status(400).json({ error: 'Missing required loan detail fields' });
+    }
+
+    const created = await LoanDetail.create({
+      userId: userId || null,
+      userEmail: String(userEmail || '').trim().toLowerCase(),
+      fullName: normalizedName,
+      jobType: normalizedJobType,
+      annualIncome: toNumber(annualIncome),
+      monthlyIncome: toNumber(monthlyIncome),
+      cibilScore: toNumber(cibilScore),
+      loanType: normalizedLoanType,
+      loanAmount: toNumber(loanAmount),
+    });
+
+    return res.status(201).json({ message: 'Loan details stored', id: created._id });
+  } catch (error) {
+    console.error('Loan details save error:', error.message);
+    return res.status(500).json({ error: 'Failed to save loan details' });
+  }
+});
+
+app.post('/api/existing-loans', async (req, res) => {
+  try {
+    const {
+      userId,
+      userEmail,
+      loanDetailId,
+      hasExistingLoan,
+      loanType,
+      totalLoanAmount,
+      monthlyEMI,
+      remainingTenure,
+      pendingEMI,
+      verificationStatus,
+      verificationMessage,
+    } = req.body || {};
+
+    if (typeof hasExistingLoan !== 'boolean') {
+      return res.status(400).json({ error: 'hasExistingLoan must be provided' });
+    }
+
+    const created = await ExistingLoan.create({
+      userId: userId || null,
+      userEmail: String(userEmail || '').trim().toLowerCase(),
+      loanDetailId: loanDetailId || null,
+      hasExistingLoan,
+      loanType: String(loanType || '').trim(),
+      totalLoanAmount: toNumber(totalLoanAmount),
+      monthlyEMI: toNumber(monthlyEMI),
+      remainingTenure: toNumber(remainingTenure),
+      pendingEMI: String(pendingEMI || '').trim().toLowerCase(),
+      verificationStatus: String(verificationStatus || (hasExistingLoan ? 'pending' : 'not_required')),
+      verificationMessage: String(verificationMessage || '').trim(),
+    });
+
+    return res.status(201).json({ message: 'Existing loan details stored', id: created._id });
+  } catch (error) {
+    console.error('Existing loan save error:', error.message);
+    return res.status(500).json({ error: 'Failed to save existing loan details' });
+  }
+});
+
+app.post('/api/documents', async (req, res) => {
+  try {
+    const {
+      userId,
+      userEmail,
+      loanDetailId,
+      existingLoanId,
+      documentType,
+      fileBase64,
+      status,
+      statusText,
+      extractedText,
+    } = req.body || {};
+
+    const normalizedType = String(documentType || '').trim();
+    const normalizedBase64 = String(fileBase64 || '').trim();
+
+    if (!normalizedType || !normalizedBase64) {
+      return res.status(400).json({ error: 'documentType and fileBase64 are required' });
+    }
+
+    const created = await Document.create({
+      userId: userId || null,
+      userEmail: String(userEmail || '').trim().toLowerCase(),
+      loanDetailId: loanDetailId || null,
+      existingLoanId: existingLoanId || null,
+      documentType: normalizedType,
+      fileBase64: normalizedBase64,
+      status: String(status || 'uploaded').trim(),
+      statusText: String(statusText || '').trim(),
+      extractedText: String(extractedText || '').trim(),
+    });
+
+    return res.status(201).json({ message: 'Document stored', id: created._id });
+  } catch (error) {
+    console.error('Document save error:', error.message);
+    return res.status(500).json({ error: 'Failed to save document' });
+  }
+});
+
+app.post('/api/loan-approvals', async (req, res) => {
+  try {
+    const {
+      userId,
+      userEmail,
+      loanDetailId,
+      existingLoanId,
+      documentIds,
+      annualIncome,
+      cibilScore,
+      jobType,
+      loanType,
+      requestedLoanAmount,
+      suggestedLoanAmount,
+      approvalPercentage,
+      decisionLabel,
+      documentVerificationScore,
+      emiHistory,
+    } = req.body || {};
+
+    const created = await LoanApproval.create({
+      userId: userId || null,
+      userEmail: String(userEmail || '').trim().toLowerCase(),
+      loanDetailId: loanDetailId || null,
+      existingLoanId: existingLoanId || null,
+      documentIds: Array.isArray(documentIds) ? documentIds.filter(Boolean) : [],
+      annualIncome: toNumber(annualIncome),
+      cibilScore: toNumber(cibilScore),
+      jobType: String(jobType || '').trim(),
+      loanType: String(loanType || '').trim(),
+      requestedLoanAmount: toNumber(requestedLoanAmount),
+      suggestedLoanAmount: toNumber(suggestedLoanAmount),
+      approvalPercentage: toNumber(approvalPercentage),
+      decisionLabel: String(decisionLabel || '').trim(),
+      documentVerificationScore: toNumber(documentVerificationScore),
+      emiHistory: {
+        hasExistingLoan: Boolean(emiHistory?.hasExistingLoan),
+        monthlyEMI: toNumber(emiHistory?.monthlyEMI),
+        pendingEMI: String(emiHistory?.pendingEMI || '').trim().toLowerCase(),
+        remainingTenure: toNumber(emiHistory?.remainingTenure),
+      },
+    });
+
+    return res.status(201).json({ message: 'Loan approval stored', id: created._id });
+  } catch (error) {
+    console.error('Loan approval save error:', error.message);
+    return res.status(500).json({ error: 'Failed to save loan approval' });
+  }
+});
+
+app.get('/api/users/pipeline', async (req, res) => {
+  try {
+    const rawUserId = String(req.query.userId || '').trim();
+    const rawEmail = String(req.query.email || '').trim().toLowerCase();
+
+    if (!rawUserId && !rawEmail) {
+      return res.status(400).json({ error: 'Provide userId or email query parameter' });
+    }
+
+    let user = null;
+
+    if (rawUserId) {
+      if (!mongoose.Types.ObjectId.isValid(rawUserId)) {
+        return res.status(400).json({ error: 'Invalid userId format' });
+      }
+      user = await User.findById(rawUserId).lean();
+    }
+
+    if (!user && rawEmail) {
+      user = await User.findOne({ email: rawEmail }).lean();
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userId = user._id;
+    const userEmail = String(user.email || '').toLowerCase();
+
+    const [loanDetails, existingLoans, documents, loanApprovals] = await Promise.all([
+      LoanDetail.find({ $or: [{ userId }, { userEmail }] }).sort({ createdAt: -1 }).lean(),
+      ExistingLoan.find({ $or: [{ userId }, { userEmail }] }).sort({ createdAt: -1 }).lean(),
+      Document.find({ $or: [{ userId }, { userEmail }] }).sort({ createdAt: -1 }).lean(),
+      LoanApproval.find({ $or: [{ userId }, { userEmail }] }).sort({ createdAt: -1 }).lean(),
+    ]);
+
+    const userResponse = {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      lastLoginAt: user.lastLoginAt || null,
+      loginCount: Number(user.loginCount || 0),
+    };
+
+    return res.status(200).json({
+      user: userResponse,
+      loanDetails,
+      existingLoans,
+      documents,
+      loanApprovals,
+      counts: {
+        loanDetails: loanDetails.length,
+        existingLoans: existingLoans.length,
+        documents: documents.length,
+        loanApprovals: loanApprovals.length,
+      },
+    });
+  } catch (error) {
+    console.error('Pipeline fetch error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch user pipeline data' });
+  }
+});
+
 const otpStore = new Map();
 const OTP_EXPIRY_MS = 10 * 60 * 1000;
+const isProduction = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+const allowOtpDevFallback =
+  String(process.env.ALLOW_OTP_DEV_FALLBACK || 'true').toLowerCase() !== 'false';
 
 const sendOtpViaEmailJs = async ({ toName, toEmail, otp }) => {
   const serviceId = String(process.env.EMAILJS_SERVICE_ID || '').trim();
@@ -107,16 +440,37 @@ app.post('/auth/send-otp', async (req, res) => {
     });
   } catch (error) {
     console.error('Send OTP error:', error.message);
-    if (String(error.message || '').includes('EMAILJS_NOT_CONFIGURED')) {
+    const isEmailConfigError = String(error.message || '').includes('EMAILJS_NOT_CONFIGURED');
+    const isEmailSendError = String(error.message || '').includes('EMAILJS_SEND_FAILED');
+    const hasInvalidGrant = String(error.message || '').toLowerCase().includes('invalid grant');
+
+    if ((isEmailConfigError || isEmailSendError) && !isProduction && allowOtpDevFallback) {
+      const fallbackEntry = otpStore.get(String(req.body?.email || '').trim().toLowerCase());
+      return res.status(200).json({
+        message:
+          'Email service is unavailable. OTP generated in development fallback mode. Use the OTP shown here.',
+        deliveryMode: 'development-fallback',
+        otp: fallbackEntry?.otp || null,
+      });
+    }
+
+    if (isEmailConfigError) {
       return res.status(500).json({
         error:
           'EmailJS is not configured. Set EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, and EMAILJS_PRIVATE_KEY in server/.env.',
       });
     }
 
-    if (String(error.message || '').includes('EMAILJS_SEND_FAILED')) {
+    if (isEmailSendError && hasInvalidGrant) {
       return res.status(500).json({
-        error: 'Failed to send OTP email via EmailJS. Verify EmailJS service/template/key configuration.',
+        error:
+          'EmailJS Gmail connection expired (Invalid grant). Reconnect your Gmail account in EmailJS service settings, then retry OTP.',
+      });
+    }
+
+    if (isEmailSendError) {
+      return res.status(500).json({
+        error: 'Failed to send OTP via EmailJS. Verify service/template/public/private keys and connected email provider.',
       });
     }
 
@@ -198,6 +552,10 @@ app.post('/auth/login', async (req, res) => {
     if (!passwordMatches) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    user.lastLoginAt = new Date();
+    user.loginCount = Number(user.loginCount || 0) + 1;
+    await user.save();
 
     return res.status(200).json({
       message: 'Login successful',
