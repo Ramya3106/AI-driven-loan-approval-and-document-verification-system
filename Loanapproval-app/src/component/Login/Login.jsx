@@ -102,7 +102,11 @@ export default function Login({ navigation }) {
         throw new Error(payload?.error || 'Unable to send OTP');
       }
 
-      Alert.alert('OTP sent', 'Check your email for the OTP and enter it here.');
+      if (payload?.deliveryMode === 'development-fallback' && payload?.otp) {
+        Alert.alert('OTP generated', `Development fallback OTP: ${payload.otp}`);
+      } else {
+        Alert.alert('OTP sent', 'Check your email for the OTP and enter it here.');
+      }
     } catch (error) {
       Alert.alert('OTP error', error?.message || 'Unable to send OTP');
     } finally {
@@ -174,7 +178,7 @@ export default function Login({ navigation }) {
         throw new Error(payload?.error || 'Unable to login');
       }
 
-      navigation.navigate('Application');
+      navigation.navigate('Application', { user: payload?.user || null });
     } catch (error) {
       Alert.alert('Login error', error?.message || 'Unable to login');
     } finally {
