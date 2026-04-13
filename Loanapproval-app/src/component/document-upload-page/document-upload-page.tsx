@@ -539,7 +539,14 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
   return (
     <SafeAreaView style={styles.screen}>
-      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.container}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        nestedScrollEnabled
+      >
         <Text style={styles.title}>Upload Required Documents</Text>
         <Text style={styles.subtitle}>Accepted formats: Image / PDF (AI OCR uses image uploads)</Text>
 
@@ -612,7 +619,11 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f4f7fb',
   },
+  scroll: {
+    flex: 1,
+  },
   container: {
+    flexGrow: 1,
     padding: 16,
     paddingBottom: 28,
   },
