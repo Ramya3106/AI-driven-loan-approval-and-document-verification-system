@@ -345,10 +345,18 @@ export default function ExistingLoanDetails({ navigation, route }) {
   return (
     <SafeAreaView style={styles.screen}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}
         style={styles.screen}
       >
-        <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.container}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          nestedScrollEnabled
+        >
           <Text style={styles.title}>Your Existing Loans & EMIs</Text>
           <Text style={styles.subtitle}>Please provide details of any existing loans</Text>
 
@@ -460,7 +468,11 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f7fa',
   },
+  scroll: {
+    flex: 1,
+  },
   container: {
+    flexGrow: 1,
     padding: 16,
     paddingBottom: 28,
   },
