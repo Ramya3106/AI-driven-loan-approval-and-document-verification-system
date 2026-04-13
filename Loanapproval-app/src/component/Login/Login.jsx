@@ -10,6 +10,7 @@ import {
   SafeAreaView,
   KeyboardAvoidingView,
   Platform,
+  ScrollView,
 } from 'react-native';
 import Constants from 'expo-constants';
 
@@ -189,142 +190,152 @@ export default function Login({ navigation }) {
   return (
     <SafeAreaView style={styles.screen}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}
         style={styles.screen}
       >
-        <View style={styles.header}>
-          <Text style={styles.title}>AI-Powered Loan System</Text>
-          <Text style={styles.subtitle}>
-            {isLogin ? 'Login to continue' : 'Create your account'}
-          </Text>
-        </View>
-
-        <View style={styles.card}>
-          <View style={styles.segmented}>
-            <TouchableOpacity
-              style={[styles.segmentButton, isLogin && styles.segmentActive]}
-              onPress={() => setIsLogin(true)}
-            >
-              <Text style={[styles.segmentText, isLogin && styles.segmentTextActive]}>
-                Login
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.segmentButton, !isLogin && styles.segmentActive]}
-              onPress={() => setIsLogin(false)}
-            >
-              <Text style={[styles.segmentText, !isLogin && styles.segmentTextActive]}>
-                Signup
-              </Text>
-            </TouchableOpacity>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.container}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          nestedScrollEnabled
+        >
+          <View style={styles.header}>
+            <Text style={styles.title}>AI-Powered Loan System</Text>
+            <Text style={styles.subtitle}>
+              {isLogin ? 'Login to continue' : 'Create your account'}
+            </Text>
           </View>
 
-          {!isLogin && (
+          <View style={styles.card}>
+            <View style={styles.segmented}>
+              <TouchableOpacity
+                style={[styles.segmentButton, isLogin && styles.segmentActive]}
+                onPress={() => setIsLogin(true)}
+              >
+                <Text style={[styles.segmentText, isLogin && styles.segmentTextActive]}>
+                  Login
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.segmentButton, !isLogin && styles.segmentActive]}
+                onPress={() => setIsLogin(false)}
+              >
+                <Text style={[styles.segmentText, !isLogin && styles.segmentTextActive]}>
+                  Signup
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {!isLogin && (
+              <View style={styles.fieldGroup}>
+                <Text style={styles.label}>Full Name</Text>
+                <TextInput
+                  placeholder="Enter your full name"
+                  placeholderTextColor="#9aa3af"
+                  style={styles.input}
+                  value={signupName}
+                  onChangeText={setSignupName}
+                />
+              </View>
+            )}
+
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>Full Name</Text>
+              <Text style={styles.label}>Email</Text>
               <TextInput
-                placeholder="Enter your full name"
+                placeholder="Enter email"
                 placeholderTextColor="#9aa3af"
+                keyboardType="email-address"
+                autoCapitalize="none"
                 style={styles.input}
-                value={signupName}
-                onChangeText={setSignupName}
+                value={isLogin ? loginEmail : signupEmail}
+                onChangeText={isLogin ? setLoginEmail : setSignupEmail}
               />
             </View>
-          )}
 
-          <View style={styles.fieldGroup}>
-            <Text style={styles.label}>Email</Text>
-            <TextInput
-              placeholder="Enter email"
-              placeholderTextColor="#9aa3af"
-              keyboardType="email-address"
-              autoCapitalize="none"
-              style={styles.input}
-              value={isLogin ? loginEmail : signupEmail}
-              onChangeText={isLogin ? setLoginEmail : setSignupEmail}
-            />
-          </View>
-
-          {!isLogin && (
-            <View style={styles.fieldGroup}>
-              <Text style={styles.label}>OTP</Text>
-              <View style={styles.otpRow}>
-                <TextInput
-                  placeholder="Enter OTP"
-                  placeholderTextColor="#9aa3af"
-                  keyboardType="number-pad"
-                  maxLength={6}
-                  style={[styles.input, styles.otpInput]}
-                  value={signupOtp}
-                  onChangeText={setSignupOtp}
-                />
-                <TouchableOpacity
-                  style={[styles.otpButton, otpSending && styles.buttonDisabled]}
-                  onPress={handleSendOtp}
-                  disabled={otpSending}
-                >
-                  {otpSending ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
-                  ) : (
-                    <Text style={styles.otpButtonText}>Send OTP</Text>
-                  )}
-                </TouchableOpacity>
+            {!isLogin && (
+              <View style={styles.fieldGroup}>
+                <Text style={styles.label}>OTP</Text>
+                <View style={styles.otpRow}>
+                  <TextInput
+                    placeholder="Enter OTP"
+                    placeholderTextColor="#9aa3af"
+                    keyboardType="number-pad"
+                    maxLength={6}
+                    style={[styles.input, styles.otpInput]}
+                    value={signupOtp}
+                    onChangeText={setSignupOtp}
+                  />
+                  <TouchableOpacity
+                    style={[styles.otpButton, otpSending && styles.buttonDisabled]}
+                    onPress={handleSendOtp}
+                    disabled={otpSending}
+                  >
+                    {otpSending ? (
+                      <ActivityIndicator color="#ffffff" size="small" />
+                    ) : (
+                      <Text style={styles.otpButtonText}>Send OTP</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
               </View>
-            </View>
-          )}
+            )}
 
-          <View style={styles.fieldGroup}>
-            <Text style={styles.label}>Password</Text>
-            <TextInput
-              placeholder="Enter password"
-              placeholderTextColor="#9aa3af"
-              secureTextEntry
-              style={styles.input}
-              value={isLogin ? loginPassword : signupPassword}
-              onChangeText={isLogin ? setLoginPassword : setSignupPassword}
-            />
-          </View>
-
-          {!isLogin && (
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>Confirm Password</Text>
+              <Text style={styles.label}>Password</Text>
               <TextInput
-                placeholder="Re-enter password"
+                placeholder="Enter password"
                 placeholderTextColor="#9aa3af"
                 secureTextEntry
                 style={styles.input}
-                value={confirmPassword}
-                onChangeText={setConfirmPassword}
+                value={isLogin ? loginPassword : signupPassword}
+                onChangeText={isLogin ? setLoginPassword : setSignupPassword}
               />
             </View>
-          )}
 
-          <TouchableOpacity
-            style={[
-              styles.primaryButton,
-              (loggingIn || registering) && styles.buttonDisabled,
-            ]}
-            onPress={isLogin ? handleLogin : handleRegister}
-            disabled={loggingIn || registering}
-          >
-            {loggingIn || registering ? (
-              <ActivityIndicator color="#ffffff" size="small" />
-            ) : (
-              <Text style={styles.primaryButtonText}>{isLogin ? 'Login' : 'Register'}</Text>
+            {!isLogin && (
+              <View style={styles.fieldGroup}>
+                <Text style={styles.label}>Confirm Password</Text>
+                <TextInput
+                  placeholder="Re-enter password"
+                  placeholderTextColor="#9aa3af"
+                  secureTextEntry
+                  style={styles.input}
+                  value={confirmPassword}
+                  onChangeText={setConfirmPassword}
+                />
+              </View>
             )}
-          </TouchableOpacity>
 
-          <View style={styles.switchRow}>
-            <Text style={styles.switchText}>
-              {isLogin ? "Don't have an account?" : 'Already have an account?'}
-            </Text>
-            <TouchableOpacity onPress={() => setIsLogin((prev) => !prev)}>
-              <Text style={styles.switchAction}>
-                {isLogin ? 'Signup' : 'Login'}
-              </Text>
+            <TouchableOpacity
+              style={[
+                styles.primaryButton,
+                (loggingIn || registering) && styles.buttonDisabled,
+              ]}
+              onPress={isLogin ? handleLogin : handleRegister}
+              disabled={loggingIn || registering}
+            >
+              {loggingIn || registering ? (
+                <ActivityIndicator color="#ffffff" size="small" />
+              ) : (
+                <Text style={styles.primaryButtonText}>{isLogin ? 'Login' : 'Register'}</Text>
+              )}
             </TouchableOpacity>
+
+            <View style={styles.switchRow}>
+              <Text style={styles.switchText}>
+                {isLogin ? "Don't have an account?" : 'Already have an account?'}
+              </Text>
+              <TouchableOpacity onPress={() => setIsLogin((prev) => !prev)}>
+                <Text style={styles.switchAction}>
+                  {isLogin ? 'Signup' : 'Login'}
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -334,8 +345,15 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: '#0f172a',
+  },
+  scroll: {
+    flex: 1,
+  },
+  container: {
+    flexGrow: 1,
     paddingHorizontal: 20,
     paddingTop: 24,
+    paddingBottom: 24,
   },
   header: {
     alignItems: 'center',
