@@ -440,7 +440,11 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
       const statusText = normalizeText(aiResult?.status);
       const isSalarySlip = key === 'salarySlip';
-      const isNameMatched = aiResult?.checks?.name !== false;
+      const isBankStatement = key === 'bankStatement';
+      // Do NOT relax name check for salary slips; only bank statements keep relaxed name logic
+      const relaxNameCheck = isBankStatement;
+      const isNameMatched = relaxNameCheck ? true : aiResult?.checks?.name === true;
+      // For salary slips require definitive 'matched' income
       const isIncomeMatched = aiResult?.checks?.income === 'matched';
       const isOriginal = statusText === 'original' && isNameMatched && (!isSalarySlip || isIncomeMatched);
       const backendMessage = String(aiResult?.message || '').trim();

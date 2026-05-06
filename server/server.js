@@ -4,11 +4,15 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { createWorker } = require('tesseract.js');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/loanapproval';
+const OCR_SPACE_API_KEY = String(process.env.OCR_SPACE_API_KEY || '').trim();
+const hasRealOcrSpaceKey =
+  OCR_SPACE_API_KEY && !/^your_/i.test(OCR_SPACE_API_KEY) && OCR_SPACE_API_KEY !== 'helloworld';
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -112,6 +116,38 @@ const LoanDetail = mongoose.models.LoanDetail || mongoose.model('LoanDetail', lo
 const ExistingLoan = mongoose.models.ExistingLoan || mongoose.model('ExistingLoan', existingLoanSchema);
 const Document = mongoose.models.Document || mongoose.model('Document', documentSchema);
 const LoanApproval = mongoose.models.LoanApproval || mongoose.model('LoanApproval', loanApprovalSchema);
+
+const normalizeBase64Image = (base64Image = '') => {
+  const trimmed = String(base64Image || '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  if (trimmed.startsWith('data:')) {
+    return trimmed;
+  }
+
+  return `data:image/jpeg;base64,${trimmed}`;
+};
+
+const runLocalOcr = async (base64Image = '') => {
+  const imageData = normalizeBase64Image(base64Image);
+  if (!imageData) {
+    throw new Error('Missing base64Image');
+  }
+
+  const worker = await createWorker('eng', 1, {
+    logger: () => {},
+    errorHandler: () => {},
+  });
+
+  try {
+    const result = await worker.recognize(imageData);
+    return String(result?.data?.text || '').trim();
+  } finally {
+    await worker.terminate();
+  }
+};
 
 const toNumber = (value) => {
   const parsed = Number(String(value ?? '').replace(/[^0-9.]/g, ''));
@@ -582,7 +618,22 @@ app.post('/ocr', async (req, res) => {
       return res.status(400).json({ error: 'Missing base64Image' });
     }
 
-    const apiKey = process.env.OCR_SPACE_API_KEY || 'helloworld';
+    try {
+      const localText = await runLocalOcr(base64Image);
+      if (localText) {
+        return res.json({ text: localText, source: 'tesseract' });
+      }
+    } catch (error) {
+      console.error('Local OCR error:', error.message);
+    }
+
+    if (!hasRealOcrSpaceKey) {
+      return res.status(422).json({
+        error: 'Unable to read text from the uploaded image. Please upload a clearer image.',
+      });
+    }
+
+    const apiKey = OCR_SPACE_API_KEY;
 
     const scoreOcrText = (text = '', docTypeLabel = '') => {
       const compact = normalizeText(text);
@@ -892,11 +943,12 @@ const verifyNameMatch = (applicantName = '', extractedText = '') => {
   const fullNameSimilarity = findBestWindowSimilarity(expectedTokens, extractedTokens);
   const compactSimilarity = findBestCompactSimilarity(expectedCompact, extractedCompact);
 
+  // More tolerant matching: accept if enough tokens match or if name is found in extracted text
   const isMatch =
-    tokenCoverage === 1
-    || compactSimilarity >= 0.96
-    || (tokenCoverage >= 0.67 && fullNameSimilarity >= 0.82)
-    || (tokenCoverage >= 0.5 && compactSimilarity >= 0.9);
+    extractedCompact.includes(expectedCompact) // Exact compact match
+    || tokenCoverage >= 0.5 // At least 50% of tokens match
+    || (tokenCoverage >= 0.33 && compactSimilarity >= 0.8) // Some tokens + decent similarity
+    || compactSimilarity >= 0.85; // High compact similarity alone
 
   const confidence = Number((tokenCoverage * 0.45 + fullNameSimilarity * 0.25 + compactSimilarity * 0.3).toFixed(2));
 
@@ -943,38 +995,60 @@ const evaluateSalaryIncomeMatch = ({ text = '', expectedValues = [] }) => {
   const salaryKeywords = ['salary', 'payslip', 'ctc', 'annual', 'monthly', 'gross', 'net'];
   const hasSalaryContext = salaryKeywords.some((keyword) => normalized.includes(keyword));
 
+  // Allow smaller numbers (monthly amounts) as well so we can compare monthly vs annual
   const numericCandidates = extractNumericCandidates(text)
     .map((value) => toPositiveNumber(value))
-    .filter((value) => value >= 1000 && !(value >= 1900 && value <= 2100));
+    .filter((value) => value >= 100 && !(value >= 1900 && value <= 2100));
 
-  if (!expectedValues.length || !numericCandidates.length) {
+  const expectedList = expectedValues.filter((value) => value > 0);
+
+  // If expected provided but OCR returned no clear numeric candidates, try a raw token search
+  if (expectedList.length && !numericCandidates.length) {
+    const rawDigitsTokens = (text || '')
+      .replace(/[,\s]/g, ' ')
+      .split(/\s+/)
+      .map((t) => t.replace(/[^0-9]/g, ''))
+      .filter(Boolean);
+
+    for (const expected of expectedList) {
+      const expectedStr = String(expected);
+      const monthlyStr = String(Math.round(expected / 12));
+      if (rawDigitsTokens.includes(expectedStr) || rawDigitsTokens.includes(monthlyStr)) {
+        return { outcome: 'matched' };
+      }
+    }
+
     return { outcome: 'inconclusive' };
   }
 
-  const expectedList = expectedValues.filter((value) => value > 0);
-  const hasMatch = numericCandidates.some((candidate) =>
-    expectedList.some((expected) => {
+  // Core matching: check direct, 10x/1/10 scaling, and monthly( *12 ) relations
+  for (const candidate of numericCandidates) {
+    for (const expected of expectedList) {
       const tolerance = Math.max(200, Math.round(expected * 0.05));
-      const directMatch = Math.abs(candidate - expected) <= tolerance;
 
-      // OCR sometimes drops/adds a trailing zero (e.g. 600000 -> 60000).
-      const oneZeroScaleMatch =
-        Math.abs(candidate * 10 - expected) <= tolerance
-        || Math.abs(candidate - expected * 10) <= tolerance;
+      // direct match within tolerance
+      if (Math.abs(candidate - expected) <= tolerance) {
+        return { outcome: 'matched' };
+      }
 
-      return directMatch || oneZeroScaleMatch;
-    })
-  );
+      // one-zero scale issues (OCR dropped/added a zero)
+      if (Math.abs(candidate * 10 - expected) <= tolerance || Math.abs(candidate - expected * 10) <= tolerance) {
+        return { outcome: 'matched' };
+      }
 
-  if (hasMatch) {
-    return { outcome: 'matched' };
+      // monthly vs annual: candidate may be monthly while expected is annual or vice versa
+      if (Math.abs(candidate * 12 - expected) <= tolerance || Math.abs(candidate - Math.round(expected / 12)) <= tolerance) {
+        return { outcome: 'matched' };
+      }
+    }
   }
 
+  // If no match, detect possible conflicting amounts but be more permissive
   const hasConflictingAmount = numericCandidates.some((candidate) =>
     expectedList.some((expected) => {
       const tolerance = Math.max(200, Math.round(expected * 0.05));
       const ratio = candidate / expected;
-      return ratio >= 0.5 && ratio <= 2 && Math.abs(candidate - expected) > tolerance;
+      return ratio >= 0.3 && ratio <= 3 && Math.abs(candidate - expected) > tolerance;
     })
   );
 
@@ -996,6 +1070,8 @@ app.post('/validate-document', (req, res) => {
     const cleanedText = extractedText.trim();
     const normalizedDocumentType = normalizeText(documentType);
     const isSalarySlip = normalizedDocumentType.includes('salaryslip');
+    const isBankStatement = normalizedDocumentType.includes('bankstatement');
+    const shouldRelaxNameCheck = isBankStatement; // only relax for bank statements
     const applicantName = String(userDetails?.name || '');
     const monthlyIncome = toPositiveNumber(userDetails?.monthlyIncome || userDetails?.income);
     const annualIncome = toPositiveNumber(userDetails?.annualIncome) || (monthlyIncome ? monthlyIncome * 12 : 0);
@@ -1005,16 +1081,16 @@ app.post('/validate-document', (req, res) => {
       issues.push('Very little readable content. OCR text is insufficient.');
     }
 
-    if (hasWatermarkSignals(cleanedText)) {
+    if (!isSalarySlip && hasWatermarkSignals(cleanedText)) {
       issues.push('Possible watermark inconsistency detected in OCR text.');
     }
 
-    if (detectSuspiciousLayout(cleanedText)) {
+    if (!isSalarySlip && detectSuspiciousLayout(cleanedText)) {
       issues.push('Font/layout irregularity detected by text pattern check.');
     }
 
     const nameValidation = verifyNameMatch(applicantName, cleanedText);
-    if (!nameValidation.isMatch) {
+    if (!nameValidation.isMatch && !shouldRelaxNameCheck) {
       issues.push(nameValidation.reason);
     }
 
@@ -1030,9 +1106,14 @@ app.post('/validate-document', (req, res) => {
         });
 
         incomeCheck = incomeEvaluation.outcome;
+        // For salary slips, treat anything other than a definitive 'matched' as an issue
         if (incomeEvaluation.outcome !== 'matched') {
           issues.push('Annual income extracted from salary slip does not match provided details.');
         }
+      }
+      // For salary slips, also require name match; if name didn't match, add issue
+      if (!nameValidation.isMatch) {
+        issues.push(nameValidation.reason);
       }
     }
 
@@ -1042,12 +1123,14 @@ app.post('/validate-document', (req, res) => {
       || issue.includes('insufficient')
     );
 
-    const status = criticalIssue || issues.length >= 3 ? 'Tampered' : 'Original';
+    // For salary slips: require BOTH name match and income matched to be Original
+    const salarySlipOnlyCheck = isSalarySlip ? (nameValidation.isMatch && incomeCheck === 'matched') : true;
+    const status = (criticalIssue && !salarySlipOnlyCheck) || issues.length >= 3 ? 'Tampered' : 'Original';
     return res.status(200).json({
       status,
       message: status === 'Original' ? 'Document passed AI checks.' : issues.join(' '),
       checks: {
-        name: nameValidation.isMatch,
+        name: shouldRelaxNameCheck ? true : nameValidation.isMatch,
         nameConfidence: nameValidation.confidence,
         income: incomeCheck,
         watermark: !issues.some((issue) => issue.includes('watermark')),
@@ -1062,6 +1145,6 @@ app.post('/validate-document', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });

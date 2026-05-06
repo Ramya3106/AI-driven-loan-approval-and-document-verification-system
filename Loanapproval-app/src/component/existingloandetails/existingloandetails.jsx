@@ -212,19 +212,52 @@ export default function ExistingLoanDetails({ navigation, route }) {
         imageUri: uploadedDocument,
         base64Image: uploadedDocumentBase64,
       });
+
       const normalizedText = normalizeText(extractedText);
       const normalizedName = normalizeText(applicantName);
       const normalizedAmount = loanData.totalLoanAmount.replace(/[^0-9]/g, '');
 
+      // Build name tokens and check token coverage (tolerant matching)
       const nameTokens = applicantName
         .split(/\s+/)
         .map((token) => normalizeText(token))
         .filter((token) => token.length > 1);
 
-      const nameMatch =
-        normalizedText.includes(normalizedName) ||
-        (nameTokens.length > 0 && nameTokens.every((token) => normalizedText.includes(token)));
-      const amountMatch = normalizedAmount && normalizedText.includes(normalizedAmount);
+      let nameMatch = false;
+      if (normalizedName && normalizedText.includes(normalizedName)) {
+        nameMatch = true;
+      } else if (nameTokens.length > 0) {
+        const matched = nameTokens.filter((token) => normalizedText.includes(token)).length;
+        const coverage = matched / nameTokens.length;
+        if (coverage >= 0.66) {
+          nameMatch = true;
+        }
+      }
+
+      // Extract numeric candidates from OCR text and compare with tolerance
+      const digitsText = (extractedText || '').replace(/[,\s]/g, '');
+      const numericCandidates = (digitsText.match(/\d{3,}/g) || []).map((s) => s.replace(/[^0-9]/g, ''));
+
+      const amountNum = Number(normalizedAmount || 0);
+      let amountMatch = false;
+      if (amountNum > 0) {
+        for (const candidate of numericCandidates) {
+          const candNum = Number(candidate || 0);
+          if (!candNum) continue;
+          if (candNum === amountNum) {
+            amountMatch = true;
+            break;
+          }
+
+          // Allow small relative differences (e.g., OCR dropped/added a zero) or scale differences
+          const diff = Math.abs(candNum - amountNum);
+          const rel = diff / Math.max(amountNum, 1);
+          if (rel <= 0.05 || candNum === amountNum * 10 || amountNum === candNum * 10) {
+            amountMatch = true;
+            break;
+          }
+        }
+      }
 
       if (!nameMatch || !amountMatch) {
         setVerificationStatus('failed');
