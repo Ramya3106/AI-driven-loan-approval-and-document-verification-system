@@ -787,7 +787,12 @@ app.post('/ocr', async (req, res) => {
   }
 });
 
-const normalizeText = (value = '') => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+const normalizeText = (value = '') => {
+  // Simple normalization: lowercase + remove special chars
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+};
 
 const normalizeWithSpaces = (value = '') =>
   value
@@ -915,50 +920,47 @@ const findBestWindowSimilarity = (expectedTokens = [], extractedTokens = []) => 
 };
 
 const verifyNameMatch = (applicantName = '', extractedText = '') => {
-  const expectedTokens = tokenizeName(applicantName);
-  const expectedCompact = normalizeText(applicantName);
-  if (!expectedTokens.length) {
-    return {
-      isMatch: false,
-      reason: 'Applicant name is missing from provided details.',
-      confidence: 0,
-    };
+  const applicantNameTrimmed = String(applicantName || '').trim();
+  if (!applicantNameTrimmed) {
+    return { isMatch: false, reason: 'Applicant name is missing from provided details.', confidence: 0 };
+  }
+  const extractedTextTrimmed = String(extractedText || '').trim();
+  if (!extractedTextTrimmed || extractedTextTrimmed.length < 10) {
+    return { isMatch: false, reason: 'Unable to read a valid name from OCR text.', confidence: 0 };
+  }
+  const applicantLower = applicantNameTrimmed.toLowerCase();
+  const extractedLower = extractedTextTrimmed.toLowerCase();
+  const expectedCompact = normalizeText(applicantNameTrimmed);
+  const extractedCompact = normalizeText(extractedTextTrimmed);
+
+  // Strategy 1: extracted text contains the full applicant name
+  if (extractedLower.includes(applicantLower)) {
+    console.log(`[verifyNameMatch] MATCH: full name found in extracted text`);
+    return { isMatch: true, confidence: 0.95, reason: 'Name matched.' };
   }
 
-  const extractedTokens = tokenizeName(extractedText);
-  const extractedCompact = normalizeText(extractedText);
-  if (!extractedTokens.length) {
-    return {
-      isMatch: false,
-      reason: 'Unable to read a valid name from OCR text.',
-      confidence: 0,
-    };
+  // Strategy 2: compact extracted contains compact form name (no special chars)
+  if (extractedCompact.includes(expectedCompact) && expectedCompact.length >= 5) {
+    console.log(`[verifyNameMatch] COMPACT MATCH`);
+    return { isMatch: true, confidence: 0.9, reason: 'Name matched.' };
   }
 
-  const matchedTokenCount = expectedTokens.filter((expectedToken) =>
-    extractedTokens.some((candidateToken) => isTokenMatch(expectedToken, candidateToken))
-  ).length;
+  // Strategy 3: token matching - ALL tokens must match (strict)
+  const expectedTokens = tokenizeName(applicantNameTrimmed);
+  const extractedTokens = tokenizeName(extractedTextTrimmed);
+  if (expectedTokens.length > 0 && extractedTokens.length > 0) {
+    const matchedCount = expectedTokens.filter((et) =>
+      extractedTokens.some((ct) => isTokenMatch(et, ct))
+    ).length;
+    const coverage = matchedCount / expectedTokens.length;
+    if (coverage >= 0.8) {
+      console.log(`[verifyNameMatch] TOKEN MATCH: ${coverage.toFixed(2)}`);
+      return { isMatch: true, confidence: 0.8, reason: 'Name matched.' };
+    }
+  }
 
-  const tokenCoverage = matchedTokenCount / expectedTokens.length;
-  const fullNameSimilarity = findBestWindowSimilarity(expectedTokens, extractedTokens);
-  const compactSimilarity = findBestCompactSimilarity(expectedCompact, extractedCompact);
-
-  // More tolerant matching: accept if enough tokens match or if name is found in extracted text
-  const isMatch =
-    extractedCompact.includes(expectedCompact) // Exact compact match
-    || tokenCoverage >= 0.5 // At least 50% of tokens match
-    || (tokenCoverage >= 0.33 && compactSimilarity >= 0.8) // Some tokens + decent similarity
-    || compactSimilarity >= 0.85; // High compact similarity alone
-
-  const confidence = Number((tokenCoverage * 0.45 + fullNameSimilarity * 0.25 + compactSimilarity * 0.3).toFixed(2));
-
-  return {
-    isMatch,
-    confidence,
-    reason: isMatch
-      ? 'Applicant name matched with OCR output.'
-      : 'Name extracted from OCR does not match the provided applicant name.',
-  };
+  console.log(`[verifyNameMatch] NO MATCH: "${applicantNameTrimmed}" not found in extracted text`);
+  return { isMatch: false, confidence: 0, reason: 'Name extracted from document does not match the provided applicant name.' };
 };
 
 const detectSuspiciousLayout = (text = '') => {
@@ -1089,8 +1091,37 @@ app.post('/validate-document', (req, res) => {
       issues.push('Font/layout irregularity detected by text pattern check.');
     }
 
-    const nameValidation = verifyNameMatch(applicantName, cleanedText);
-    if (!nameValidation.isMatch && !shouldRelaxNameCheck) {
+    // Name validation: try full text first, then header (first 300 chars) for salary slips,
+    // then individual lines (OCR may split name across lines or add noise).
+    const tryNameMatch = (name, text) => {
+      if (!name || !text || text.trim().length < 3) return { isMatch: false, confidence: 0, reason: 'No text.' };
+      // Direct: text contains name
+      if (text.toLowerCase().includes(name.toLowerCase())) return { isMatch: true, confidence: 0.99, reason: 'Name matched.' };
+      // Compact: remove non-alphanumeric
+      const nc = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const tc = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (nc.length >= 4 && tc.includes(nc)) return { isMatch: true, confidence: 0.95, reason: 'Name matched.' };
+      // Token: each word of name found in text tokens
+      const nameTokens = name.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(t => t.length > 2);
+      const textTokens = text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(t => t.length > 1);
+      if (nameTokens.length > 0) {
+        const matched = nameTokens.filter(nt => textTokens.some(tt => tt === nt || (tt.includes(nt) && nt.length >= 4) || (nt.includes(tt) && tt.length >= 4))).length;
+        if (matched / nameTokens.length >= 0.7) return { isMatch: true, confidence: 0.8, reason: 'Name matched.' };
+      }
+      return { isMatch: false, confidence: 0, reason: 'Name not found in document.' };
+    };
+
+    let nameValidation = tryNameMatch(applicantName, cleanedText);
+    // For salary slips: also try each line individually (OCR may have name on its own line)
+    if (!nameValidation.isMatch && isSalarySlip) {
+      const lines = cleanedText.split(/[\n\r]+/).map(l => l.trim()).filter(l => l.length > 2);
+      for (const line of lines) {
+        const r = tryNameMatch(applicantName, line);
+        if (r.isMatch) { nameValidation = r; break; }
+      }
+    }
+
+    if (applicantName && !nameValidation.isMatch && !shouldRelaxNameCheck) {
       issues.push(nameValidation.reason);
     }
 
@@ -1111,21 +1142,20 @@ app.post('/validate-document', (req, res) => {
           issues.push('Annual income extracted from salary slip does not match provided details.');
         }
       }
-      // For salary slips, also require name match; if name didn't match, add issue
-      if (!nameValidation.isMatch) {
-        issues.push(nameValidation.reason);
-      }
+      // name issue already pushed above in the general block
     }
 
-    const criticalIssue = issues.some((issue) =>
-      issue.includes('does not match')
-      || issue.includes('Income mismatch')
-      || issue.includes('insufficient')
-    );
+    // Determine Original status:
+    // - Salary slip: BOTH name AND income must match
+    // - All other docs: name match is the ONLY deciding factor
+    let isOriginal;
+    if (isSalarySlip) {
+      isOriginal = nameValidation.isMatch && incomeCheck === 'matched';
+    } else {
+      isOriginal = shouldRelaxNameCheck ? true : nameValidation.isMatch;
+    }
 
-    // For salary slips: require BOTH name match and income matched to be Original
-    const salarySlipOnlyCheck = isSalarySlip ? (nameValidation.isMatch && incomeCheck === 'matched') : true;
-    const status = (criticalIssue && !salarySlipOnlyCheck) || issues.length >= 3 ? 'Tampered' : 'Original';
+    const status = isOriginal ? 'Original' : 'Tampered';
     return res.status(200).json({
       status,
       message: status === 'Original' ? 'Document passed AI checks.' : issues.join(' '),
@@ -1135,7 +1165,7 @@ app.post('/validate-document', (req, res) => {
         income: incomeCheck,
         watermark: !issues.some((issue) => issue.includes('watermark')),
         layout: !issues.some((issue) => issue.includes('layout')),
-        tampering: status === 'Original',
+        tampering: isOriginal,
       },
       issues,
     });

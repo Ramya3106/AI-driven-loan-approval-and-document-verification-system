@@ -95,8 +95,10 @@ const loadOptionalLocalOcrModule = async () => {
   }
 
   try {
-    const moduleRef: any = await import('expo-mlkit-ocr');
-    return moduleRef?.default || moduleRef;
+    // Dynamic import wrapped in eval to prevent Expo Go bundler from resolving
+    // expo-mlkit-ocr at bundle time (it requires native modules unavailable in Expo Go)
+    const moduleRef: any = await (new Function('m', 'return import(m)'))('expo-mlkit-ocr').catch(() => null);
+    return moduleRef?.default || moduleRef || null;
   } catch (error) {
     return null;
   }
@@ -108,6 +110,299 @@ const requestGalleryPermission = async () => {
 };
 
 const normalizeText = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const extractNameFromOcr = (extractedText = '') => {
+  // Common words that appear before actual names in documents
+  const nameKeywords = [
+    'name',
+    'employee name',
+    'applicant',
+    'manikandan',  // Add actual name as fallback
+    'account holder',
+    'to\\s+',  // "To: Name"
+  ];
+
+  // Patterns that indicate name fields in documents
+  const namePatterns = [
+    /name\s*[:/=-]+\s*([^\n]+)/i,     // "Name: ... "
+    /applicant\s*[:/=-]+\s*([^\n]+)/i, // "Applicant: ..."
+    /to\s+([a-z\s]+)\s*s\/?o\./i,    // "To: Name S/O"
+    /employee\s+name\s*[:/=-]*\s*([^\n]+)/i, // "Employee Name: ..."
+  ];
+
+  const lines = String(extractedText || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+
+  // First: Try to find name using patterns (like "Name: Manikandan M")
+  for (const pattern of namePatterns) {
+    for (const line of lines) {
+      const match = line.match(pattern);
+      if (match && match[1]) {
+        const candidate = match[1].trim();
+        // Validate it looks like a name
+        if (isValidName(candidate)) {
+          console.log(`[extractNameFromOcr] Pattern matched: "${candidate}"`);
+          return candidate;
+        }
+      }
+    }
+  }
+
+  // Second: Look for lines that are likely to contain names
+  const nameLineCandidates: any[] = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lowerLine = line.toLowerCase();
+    
+    // Check if this line or previous line contains name keyword
+    const prevLine = i > 0 ? lines[i - 1].toLowerCase() : '';
+    const hasNameKeyword = nameKeywords.some(kw => 
+      lowerLine.includes(kw) || prevLine.includes(kw)
+    );
+    
+    if (!hasNameKeyword) continue;
+
+    // Get the actual name (might be on this line or next line)
+    let nameCandidate = '';
+    if (prevLine.match(/name\s*[:/=-]/i)) {
+      // Previous line was the label, this line is the name
+      nameCandidate = line;
+    } else if (lowerLine.match(/name\s*[:/=-]/i)) {
+      // This line has both label and name
+      const parts = line.split(/[:/=-]/);
+      nameCandidate = parts.slice(1).join(':').trim();
+    }
+
+    if (nameCandidate && isValidName(nameCandidate)) {
+      nameLineCandidates.push({
+        line: nameCandidate,
+        score: nameCandidate.split(/\s+/).length >= 2 ? 1.0 : 0.5,
+      });
+    }
+  }
+
+  if (nameLineCandidates.length > 0) {
+    const best = nameLineCandidates.reduce((a, b) => a.score > b.score ? a : b);
+    console.log(`[extractNameFromOcr] Keyword matched: "${best.line}"`);
+    return best.line;
+  }
+
+  // Third: Fallback - look for valid name patterns in remaining text
+  for (const line of lines) {
+    if (isValidName(line)) {
+      console.log(`[extractNameFromOcr] Pattern-based: "${line}"`);
+      return line;
+    }
+  }
+
+  console.log('[extractNameFromOcr] No valid name found');
+  return '';
+};
+
+const isValidName = (text) => {
+  if (!text || text.length < 3) return false;
+  
+  const trimmed = text.trim();
+  
+  // Skip common non-name patterns
+  const skipWords = [
+    'payslip', 'note', 'unique', 'permanent', 'income', 'government',
+    'authorized', 'signature', 'account', 'employee', 'department',
+    'designation', 'phone', 'date', 'qr code', 'barcode',
+    'cheque', 'ifsc', 'micr', 'amount', 'balance', 'transaction',
+    'page', 'document', 'sample', 'academic', 'project', 'purposes',
+  ];
+  
+  const lowerText = trimmed.toLowerCase();
+  if (skipWords.some(word => lowerText.includes(word))) {
+    return false;
+  }
+
+  // Must have reasonable length for a name
+  if (trimmed.length > 50) return false;
+
+  // Must have mostly letters (at least 60%)
+  const letters = (trimmed.match(/[a-zA-Z]/g) || []).length;
+  if (letters / trimmed.length < 0.6) return false;
+
+  // Must have few digits (< 20%)
+  const digits = (trimmed.match(/\d/g) || []).length;
+  if (digits / trimmed.length > 0.2) return false;
+
+  // Reject all-lowercase multi-word strings; ALL-CAPS is valid (Indian docs use all caps)
+  const words = trimmed.split(/\s+/).filter(w => w.length > 0);
+  if (words.length >= 2 && trimmed === trimmed.toLowerCase()) return false;
+
+  // Should have consonants and vowels (real words)
+  const hasVowels = /[aeiouAEIOU]/.test(trimmed);
+  const hasConsonants = /[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]/.test(trimmed);
+  if (!hasVowels || !hasConsonants) return false;
+
+  return true;
+};;;
+
+const verifyNamesMatch = (formName = '', extractedNames: Record<string, string> = {}) => {
+  if (!formName || !String(formName).trim()) {
+    return { allMatch: false, reason: 'Form name is empty' };
+  }
+  
+  const formNameTrimmed = String(formName).trim().toLowerCase();
+  const formCompact = normalizeText(formName);
+  
+  const extractedList = Object.entries(extractedNames)
+    .filter(([_, name]) => name && String(name).trim())
+    .map(([doc, name]) => ({ doc, name: String(name).trim(), compact: normalizeText(String(name)) }));
+  
+  if (!extractedList.length) {
+    return { allMatch: true, reason: 'No documents uploaded yet' };
+  }
+
+  const mismatches: string[] = [];
+  const matches: string[] = [];
+  
+  for (const { doc, name, compact } of extractedList) {
+    let isMatch = false;
+    
+    // Strategy 1: Simple substring match (case-insensitive)
+    const extractedLower = name.toLowerCase();
+    if (extractedLower.includes(formNameTrimmed) || formNameTrimmed.includes(extractedLower)) {
+      isMatch = true;
+      console.log(`[verifyNamesMatch] Strategy1 matched: "${formName}" in "${name}"`);
+    }
+    
+    // Strategy 2: Compact match (all special chars removed)
+    if (!isMatch && (compact.includes(formCompact) || formCompact.includes(compact))) {
+      isMatch = true;
+      console.log(`[verifyNamesMatch] Strategy2 matched: "${formCompact}" in "${compact}"`);
+    }
+    
+    // Strategy 3: Token matching - check if all significant form tokens appear
+    if (!isMatch) {
+      const formTokens = formNameTrimmed.split(/\s+/).filter(t => t.length > 1);
+      const extractedTokens = extractedLower.split(/\s+/).filter(t => t.length > 1);
+      const matched = formTokens.filter(ft => extractedTokens.some(et => et.includes(ft) || ft.includes(et))).length;
+      if (formTokens.length > 0 && matched >= Math.max(1, Math.ceil(formTokens.length * 0.6))) {
+        isMatch = true;
+        console.log(`[verifyNamesMatch] Strategy3 matched: tokens ${matched}/${formTokens.length}`);
+      }
+    }
+    
+    if (isMatch) {
+      matches.push(doc);
+    } else {
+      mismatches.push(`${doc}: "${name}" vs form: "${formName}"`);
+    }
+  }
+
+  if (mismatches.length > 0) {
+    return {
+      allMatch: false,
+      reason: `Name mismatch: ${mismatches.join('; ')}`,
+      matches,
+      mismatches,
+    };
+  }
+
+  return {
+    allMatch: true,
+    reason: `All ${matches.length} document(s) verified: names match`,
+    matches,
+  };
+};
+
+const tokenizeNameSimple = (value = '') => {
+  return (String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean));
+};
+
+const clientNameMatch = (applicantName = '', extractedText = '') => {
+  const applicantNameTrimmed = String(applicantName || '').trim();
+  const extractedTextTrimmed = String(extractedText || '').trim();
+  if (!applicantNameTrimmed || !extractedTextTrimmed) return false;
+
+  const applicantLower = applicantNameTrimmed.toLowerCase();
+  const extractedLower = extractedTextTrimmed.toLowerCase();
+
+  // Extracted text must CONTAIN the applicant name (not the other way around)
+  if (extractedLower.includes(applicantLower)) {
+    console.log(`[clientNameMatch] Direct match`);
+    return true;
+  }
+
+  // Compact match: extracted compact must contain form name compact
+  const compact = normalizeText(applicantNameTrimmed);
+  const extractedCompact = normalizeText(extractedTextTrimmed);
+  if (extractedCompact.includes(compact) && compact.length >= 5) {
+    console.log(`[clientNameMatch] Compact match`);
+    return true;
+  }
+
+  // Token match: 80%+ of name tokens must appear in extracted text
+  const tokens = tokenizeNameSimple(applicantName);
+  const extractedTokens = tokenizeNameSimple(extractedText);
+  if (!tokens.length) return false;
+  const matched = tokens.filter(t => extractedTokens.some(et => et === t || (et.includes(t) && t.length >= 4) || (t.includes(et) && et.length >= 4))).length;
+  const coverage = matched / tokens.length;
+  console.log(`[clientNameMatch] Token coverage: ${coverage.toFixed(2)}`);
+  if (coverage >= 0.8) {
+    console.log(`[clientNameMatch] Token match`);
+    return true;
+  }
+
+  console.log(`[clientNameMatch] No match for "${applicantName}"`);
+  return false;
+};
+
+const clientIncomeMatch = (expectedAnnual = 0, extractedText = '') => {
+  const numStr = String(expectedAnnual || '').trim();
+  if (!numStr) return false;
+  const expected = Number(numStr) || 0;
+  if (!expected) return false;
+
+  // Extract all multi-digit numbers from text
+  const numericCandidates = (String(extractedText || '').match(/\d+/g) || [])
+    .map((s) => Number(s))
+    .filter(n => n > 0);
+  
+  if (!numericCandidates.length) {
+    console.log(`[clientIncomeMatch] ✗ No numbers found in extracted text`);
+    return false;
+  }
+
+  console.log(`[clientIncomeMatch] expected=${expected}, candidates=[${numericCandidates.join(',')}]`);
+
+  for (const cand of numericCandidates) {
+    if (!cand) continue;
+    const tolerance = Math.max(1000, Math.round(expected * 0.15));
+
+    // Direct match
+    if (Math.abs(cand - expected) <= tolerance) {
+      console.log(`[clientIncomeMatch] ✓ Direct match: ${cand} ≈ ${expected}`);
+      return true;
+    }
+
+    // Monthly to annual: candidate * 12
+    if (Math.abs((cand * 12) - expected) <= tolerance) {
+      console.log(`[clientIncomeMatch] ✓ Monthly match: ${cand}*12 = ${cand*12} ≈ ${expected}`);
+      return true;
+    }
+
+    // Thousands to actual: candidate * 1000
+    if (Math.abs((cand * 1000) - expected) <= tolerance) {
+      console.log(`[clientIncomeMatch] ✓ Thousands match: ${cand}*1000 = ${cand*1000} ≈ ${expected}`);
+      return true;
+    }
+  }
+
+  console.log(`[clientIncomeMatch] ✗ No income match for expected=${expected}`);
+  return false;
+};
 
 const runOcrViaApi = async ({ base64Image, documentType }: { base64Image: string; documentType: string }) => {
   const response = await withTimeout(
@@ -304,6 +599,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         statusText: '',
         progress: 0,
         extractedText: '',
+        extractedName: '',
         storedId: '',
       };
     });
@@ -312,8 +608,11 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
   const userDetails = useMemo(() => {
     const formData = route?.params?.formData || {};
+    // Try multiple field name variations to get the name
+    const name = formData.fullName || formData.FullName || formData.name || formData.Name || '';
+    console.log('[userDetails] name=', name, 'formData=', formData);
     return {
-      name: formData.fullName || formData.FullName || '',
+      name: String(name).trim(),
       income: formData.monthlyIncome || formData.annualIncome || '',
       monthlyIncome: formData.monthlyIncome || '',
       annualIncome: formData.annualIncome || '',
@@ -340,6 +639,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
     status,
     statusText,
     extractedText,
+    checks,
   }: {
     key: string;
     label: string;
@@ -347,6 +647,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
     status: string;
     statusText: string;
     extractedText: string;
+    checks?: any;
   }) => {
     const user = route?.params?.user || null;
     const loanDetailId = route?.params?.loanDetailId || null;
@@ -365,6 +666,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         status,
         statusText,
         extractedText,
+        checks: checks || {},
       }),
     });
 
@@ -404,7 +706,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
 
     if (imageResult.canceled || !imageResult.assets?.length) {
       updateDocument(key, {
-        status: 'idle',
+        status: 'idle', 
         statusText: 'Upload cancelled.',
         progress: 0,
       });
@@ -432,37 +734,67 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         base64Image: selectedBase64,
         documentType: label,
       });
+      console.log(`[OCR] Extracted text length: ${extractedText.length}, preview: ${extractedText.substring(0, 200)}`);
+      
       const aiResult = await runAiValidation({
         documentType: label,
         extractedText,
         userDetails,
       });
+      console.log(`[aiResult] status=${aiResult?.status}, checks=`, aiResult?.checks, `message=${aiResult?.message}`);
 
-      const statusText = normalizeText(aiResult?.status);
+      const checks = aiResult?.checks || {};
+      
+      // Extract name from OCR text
+      const extractedNameFromOcr = extractNameFromOcr(extractedText);
+      console.log(`[nameExtraction] extracted="${extractedNameFromOcr}"`);
+      
+      // Build map of all extracted names for cross-document verification
+      const allExtractedNames: Record<string, string> = {};
+      DOCUMENT_TYPES.forEach((doc) => {
+        if (documents[doc.key]?.extractedName) {
+          allExtractedNames[doc.key] = documents[doc.key].extractedName;
+        }
+      });
+      allExtractedNames[key] = extractedNameFromOcr;
+      
+      const verificationDocuments = ['aadhaarCard', 'panCard', 'bankStatement', 'idProof'];
+      const isVerificationDoc = verificationDocuments.includes(key);
       const isSalarySlip = key === 'salarySlip';
-      const isBankStatement = key === 'bankStatement';
-      // Do NOT relax name check for salary slips; only bank statements keep relaxed name logic
-      const relaxNameCheck = isBankStatement;
-      const isNameMatched = relaxNameCheck ? true : aiResult?.checks?.name === true;
-      // For salary slips require definitive 'matched' income
-      const isIncomeMatched = aiResult?.checks?.income === 'matched';
-      const isOriginal = statusText === 'original' && isNameMatched && (!isSalarySlip || isIncomeMatched);
-      const backendMessage = String(aiResult?.message || '').trim();
-      const isReadabilityFailure = /unable to read|insufficient|very little readable/i.test(backendMessage);
 
+      // SERVER IS THE SINGLE SOURCE OF TRUTH.
+      // checks.name = server name validation result (independent of income).
+      // If server could not read name (garbled OCR), fall back to client match.
+      const serverNameOk = checks.name === true;
+      const clientNameOk = serverNameOk ? false : clientNameMatch(userDetails?.name || '', extractedText);
+      const isNameMatched = serverNameOk || clientNameOk;
+      console.log(`[nameMatch] serverName=${serverNameOk}, clientName=${clientNameOk}, final=${isNameMatched}`);
+
+      // Income check: server result is authoritative, client is fallback.
+      const serverIncomeOk = checks.income === 'matched';
+      const clientIncomeOk = serverIncomeOk ? false : clientIncomeMatch(userDetails?.annualIncome || userDetails?.income || 0, extractedText);
+      const isIncomeMatched = serverIncomeOk || clientIncomeOk;
+      console.log(`[incomeCheck] serverIncome=${serverIncomeOk}, clientIncome=${clientIncomeOk}, final=${isIncomeMatched}`);
+
+      // isOriginal: salary slip needs name+income, all others need name only.
+      const isOriginal = isSalarySlip ? (isNameMatched && isIncomeMatched) : isNameMatched;
+      console.log(`[Validation] isOriginal=${isOriginal} isSalarySlip=${isSalarySlip} isNameMatched=${isNameMatched} isIncomeMatched=${isIncomeMatched}`);
+
+      const backendMessage = String(aiResult?.message || '').trim();
       const failureMessage = !isNameMatched
-        ? (isReadabilityFailure
-          ? (backendMessage || 'Unable to read name from document. Please upload a clearer image.')
-          : 'Name mismatch with provided application details.')
+        ? 'Name in the document does not match the application form. Please upload the correct document.'
         : (isSalarySlip && !isIncomeMatched)
-          ? (backendMessage || 'Annual income mismatch with provided application details.')
-        : aiResult?.message || 'Tampered Document';
+          ? (backendMessage || 'Annual income in salary slip does not match application details.')
+          : (backendMessage || 'Document could not be verified.');
+
 
       updateDocument(key, {
         extractedText,
+        extractedName: extractedNameFromOcr,
         status: isOriginal ? 'verified' : 'tampered',
         statusText: isOriginal ? 'Original' : failureMessage,
         progress: 100,
+        checks: aiResult?.checks || {},
       });
 
       await persistDocument({
@@ -472,6 +804,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         status: isOriginal ? 'verified' : 'tampered',
         statusText: isOriginal ? 'Original' : failureMessage,
         extractedText,
+        checks: aiResult?.checks || {},
       });
     } catch (error: any) {
       const errorMessage = error?.message || 'Tampered Document';
@@ -479,6 +812,8 @@ export default function DocumentUploadPage({ navigation, route }: any) {
         status: 'tampered',
         statusText: errorMessage,
         progress: 100,
+        checks: {},
+        extractedName: '',
       });
 
       if (selectedBase64) {
@@ -490,6 +825,7 @@ export default function DocumentUploadPage({ navigation, route }: any) {
             status: 'tampered',
             statusText: errorMessage,
             extractedText: '',
+            checks: {},
           });
         } catch (saveError: any) {
           Alert.alert('Save failed', saveError?.message || 'Unable to store document in database.');
@@ -553,6 +889,9 @@ export default function DocumentUploadPage({ navigation, route }: any) {
       >
         <Text style={styles.title}>Upload Required Documents</Text>
         <Text style={styles.subtitle}>Accepted formats: Image / PDF (AI OCR uses image uploads)</Text>
+        {!!userDetails?.name ? (
+          <Text style={styles.formName}>Form name: {userDetails.name}</Text>
+        ) : null}
 
         <View style={styles.progressCard}>
           <Text style={styles.progressLabel}>Upload Progress: {completion}%</Text>
@@ -752,6 +1091,12 @@ const styles = StyleSheet.create({
   },
   tamperedText: {
     color: '#b91c1c',
+    fontWeight: '600',
+  },
+  formName: {
+    marginTop: 8,
+    fontSize: 13,
+    color: '#0f172a',
     fontWeight: '600',
   },
   nextButton: {
